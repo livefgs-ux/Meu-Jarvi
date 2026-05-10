@@ -40,8 +40,8 @@ It's not just an assistant — it's an extension of your digital life.
 ## ⚡ Quick Start
 
 ```bash
-git clone https://github.com/FatihMakes/Mark-XXXIX.git
-cd Mark-XXXIX
+git clone https://github.com/livefgs-ux/Meu-Jarvi.git
+cd Meu-Jarvi
 pip install -r requirements.txt
 playwright install
 python main.py
