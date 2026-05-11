@@ -13,6 +13,7 @@ from ui import JarvisUI
 from memory.memory_manager import (
     load_memory, update_memory, format_memory_for_prompt,
 )
+from memory_engine.runtime_context import build_readonly_memory_context_from_env
 
 from actions.file_processor import file_processor
 from actions.flight_finder     import flight_finder
@@ -546,6 +547,9 @@ class JarvisLive:
         parts = [time_ctx]
         if mem_str:
             parts.append(mem_str)
+        ro_memory_context = build_readonly_memory_context_from_env()
+        if ro_memory_context:
+            parts.append(ro_memory_context)
         parts.append(sys_prompt)
 
         return types.LiveConnectConfig(

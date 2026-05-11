@@ -96,8 +96,9 @@ class TestMainPyReadonlyIntegrationBaseline(unittest.TestCase):
         self.assertIn("TOOL_DECLARATIONS", self.source)
 
     def test_10_no_runtime_context_import_yet(self):
-        self.assertNotIn("memory_engine.runtime_context", self.source)
-        self.assertNotIn("build_readonly_memory_context", self.source)
+        # Phase 7E intentionally adds the runtime_context wrapper import.
+        self.assertIn("memory_engine.runtime_context", self.source)
+        self.assertIn("build_readonly_memory_context_from_env", self.source)
 
     def test_11_no_tools_cli_imports(self):
         self.assertNotIn("tools.memory_cli", self.source)
@@ -124,8 +125,8 @@ class TestMainPyReadonlyIntegrationBaseline(unittest.TestCase):
 
     def test_17_forbidden_imports_not_present(self):
         banned_imports = {
-            "memory_engine.runtime_context",
             "memory_engine.writer",
+            "memory_engine.runtime_adapter",
             "tools.memory_cli",
             "tools.memory_context_preview",
         }
@@ -138,7 +139,89 @@ class TestMainPyReadonlyIntegrationBaseline(unittest.TestCase):
                 mod = node.module or ""
                 self.assertNotIn(mod, banned_imports)
 
+    def test_18_imports_runtime_context_wrapper_only(self):
+        found = False
+        for node in ast.walk(self.tree):
+            if isinstance(node, ast.ImportFrom) and (node.module or "") == "memory_engine.runtime_context":
+                names = {a.name for a in node.names}
+                if "build_readonly_memory_context_from_env" in names:
+                    found = True
+        self.assertTrue(found, "Expected import of build_readonly_memory_context_from_env from memory_engine.runtime_context")
+
+    def test_19_build_config_calls_wrapper(self):
+        jarvis = next(n for n in self.tree.body if isinstance(n, ast.ClassDef) and n.name == "JarvisLive")
+        build = next(n for n in jarvis.body if isinstance(n, ast.FunctionDef) and n.name == "_build_config")
+
+        calls = [
+            n for n in ast.walk(build)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "build_readonly_memory_context_from_env"
+        ]
+        self.assertTrue(calls, "Expected _build_config() to call build_readonly_memory_context_from_env()")
+
+    def test_20_wrapper_call_is_not_at_module_level(self):
+        # Ensure wrapper isn't called globally at import time.
+        for node in self.tree.body:
+            if isinstance(node, ast.Expr) and isinstance(getattr(node, "value", None), ast.Call):
+                call = node.value
+                if isinstance(call.func, ast.Name) and call.func.id == "build_readonly_memory_context_from_env":
+                    self.fail("build_readonly_memory_context_from_env() must not be called at module level")
+
+    def test_21_wrapper_result_appended_conditionally(self):
+        jarvis = next(n for n in self.tree.body if isinstance(n, ast.ClassDef) and n.name == "JarvisLive")
+        build = next(n for n in jarvis.body if isinstance(n, ast.FunctionDef) and n.name == "_build_config")
+
+        # We expect an If statement: if ro_memory_context: parts.append(ro_memory_context)
+        found = False
+        for node in ast.walk(build):
+            if isinstance(node, ast.If) and isinstance(node.test, ast.Name) and node.test.id == "ro_memory_context":
+                # Look for parts.append(ro_memory_context) in the if body.
+                for inner in ast.walk(node):
+                    if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute):
+                        if inner.func.attr == "append" and isinstance(inner.func.value, ast.Name) and inner.func.value.id == "parts":
+                            if inner.args and isinstance(inner.args[0], ast.Name) and inner.args[0].id == "ro_memory_context":
+                                found = True
+        self.assertTrue(found, "Expected conditional parts.append(ro_memory_context) guarded by if ro_memory_context")
+
+    def test_22_readonly_memory_append_occurs_before_sys_prompt_append(self):
+        jarvis = next(n for n in self.tree.body if isinstance(n, ast.ClassDef) and n.name == "JarvisLive")
+        build = next(n for n in jarvis.body if isinstance(n, ast.FunctionDef) and n.name == "_build_config")
+
+        def is_parts_append_name(stmt: ast.stmt, name: str) -> bool:
+            if not isinstance(stmt, ast.Expr):
+                return False
+            call = stmt.value
+            if not isinstance(call, ast.Call):
+                return False
+            if not isinstance(call.func, ast.Attribute):
+                return False
+            if call.func.attr != "append":
+                return False
+            if not isinstance(call.func.value, ast.Name) or call.func.value.id != "parts":
+                return False
+            return bool(call.args) and isinstance(call.args[0], ast.Name) and call.args[0].id == name
+
+        def is_if_appending_ro(stmt: ast.stmt) -> bool:
+            if not isinstance(stmt, ast.If):
+                return False
+            if not isinstance(stmt.test, ast.Name) or stmt.test.id != "ro_memory_context":
+                return False
+            for inner in stmt.body:
+                if is_parts_append_name(inner, "ro_memory_context"):
+                    return True
+            return False
+
+        sys_prompt_append_idx = None
+        ro_append_idx = None
+        for idx, stmt in enumerate(build.body):
+            if is_parts_append_name(stmt, "sys_prompt"):
+                sys_prompt_append_idx = idx
+            if is_if_appending_ro(stmt):
+                ro_append_idx = idx
+
+        self.assertIsNotNone(ro_append_idx, "Expected if ro_memory_context: parts.append(ro_memory_context) in _build_config body")
+        self.assertIsNotNone(sys_prompt_append_idx, "Expected parts.append(sys_prompt) in _build_config body")
+        self.assertLess(ro_append_idx, sys_prompt_append_idx, "Expected read-only memory append to occur before sys_prompt append")
+
 
 if __name__ == "__main__":
     unittest.main()
-
