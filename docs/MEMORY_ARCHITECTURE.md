@@ -73,6 +73,19 @@ The CLI supports both invocation styles:
 
 The recommended developer form is `python -m tools.memory_cli ...` because it uses package-style imports. Direct script invocation is supported for convenience from the repository root.
 
+## Read-Only Runtime Adapter (Design Only)
+
+Before any runtime integration is implemented, a read-only adapter should be introduced to allow the Jarvis runtime to retrieve a bounded memory context from `data/jarvis_memory.db`.
+
+This adapter must:
+
+- Open SQLite in strict read-only mode (`mode=ro`).
+- Never write to SQLite and never write to `data/raw_events.jsonl`.
+- Never create, validate, promote, archive, or update memories.
+- Only retrieve a small context for prompt insertion with strict limits.
+
+This is intended as the first step toward safe runtime usage: read-only retrieval first, no automatic writing.
+
 CLI lifecycle controls allow memories to be inspected, promoted through statuses, deprecated, archived, and audited manually. This keeps validation explicit before runtime integration.
 
 Memories should be reviewed and promoted through lifecycle statuses instead of blindly trusted at write time.

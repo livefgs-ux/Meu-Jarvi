@@ -6,3 +6,5 @@ data/vector_index/
 __pycache__/
 *.pyc
 inicialmente.txt
+.venv/
+config/api_keys.json

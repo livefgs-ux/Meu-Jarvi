@@ -60,3 +60,12 @@ The Phase 3 Brain Foundation is standalone. It may initialize and use the Memory
 Memory writes must remain explicit until runtime integration is separately approved. Automatic learning, save-everything behavior, and background memory capture are not part of the current phase.
 
 Runtime integration must not automatically validate memories. Manual or policy-driven validation is required before high-priority behavioral memories are trusted.
+
+## Read-Only Runtime Memory Boundary
+
+Any future runtime connection to SQLite memory must be read-only first.
+
+- The runtime may read a bounded context for prompts.
+- The runtime must not write, promote, validate, deprecate, or archive memories.
+- The runtime must not append to raw event logs.
+- Global rules remain dominant and must not be overridden by project-scoped context.
