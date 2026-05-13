@@ -143,6 +143,89 @@ def validate_apply_paths(db_path: str | Path, event_log_path: str | Path) -> tup
     return db_abs, log_abs
 
 
+def validate_review_bundle_path(path: str | Path, *, overwrite: bool = False) -> Path:
+    if not path:
+        raise ValueError("--review-bundle-path is required when exporting a review bundle")
+
+    repo_root = Path(__file__).resolve().parent.parent
+    data_dir = (repo_root / "data").resolve(strict=False)
+    real_db = (data_dir / "jarvis_memory.db").resolve(strict=False)
+    real_log = (data_dir / "raw_events.jsonl").resolve(strict=False)
+    api_keys = (repo_root / "config" / "api_keys.json").resolve(strict=False)
+    dotenv = (repo_root / ".env").resolve(strict=False)
+    legacy_long_term = (repo_root / "memory" / "long_term.json").resolve(strict=False)
+
+    p = Path(path).expanduser().resolve(strict=False)
+
+    if p.suffix.lower() != ".json":
+        raise ValueError("--review-bundle-path must point to a .json file.")
+    if not p.parent.exists():
+        raise ValueError("Review bundle parent directory does not exist.")
+
+    # Refuse writing inside real runtime data directory.
+    if p == data_dir or p.is_relative_to(data_dir):
+        raise ValueError("Refusing to write review bundle inside the real data/ directory.")
+
+    if p in {real_db, real_log, api_keys, dotenv, legacy_long_term}:
+        raise ValueError("Refusing to write review bundle to a sensitive runtime/config path.")
+
+    if p.exists() and not overwrite:
+        raise ValueError("Review bundle already exists. Use --overwrite-review-bundle to replace it.")
+
+    return p
+
+
+def build_review_bundle(report: MigrationReport, *, include_content: bool = False) -> dict[str, Any]:
+    safe = _report_to_safe_json(report, include_content=include_content)
+
+    # Skip reason breakdown (safe, no content).
+    by_reason: dict[str, int] = {}
+    for c in report.candidates:
+        if c.skipped:
+            r = c.skip_reason or "unknown"
+            by_reason[r] = by_reason.get(r, 0) + 1
+
+    return {
+        "bundle_type": "legacy_memory_migration_review",
+        "bundle_version": 1,
+        "safe_by_default": True,
+        "content_included": bool(include_content),
+        "summary": {
+            "total_items": safe.get("total_items", 0),
+            "migratable_items": safe.get("migratable_items", 0),
+            "blocked_items": safe.get("blocked_items", 0),
+            "review_required_items": safe.get("review_required_items", 0),
+            "duplicate_items": safe.get("duplicate_items", 0),
+            "applied_items": safe.get("applied_items", 0),
+            "skipped_items": safe.get("skipped_items", 0),
+        },
+        "apply": {
+            "requested": bool(safe.get("apply_requested")),
+            "confirmed": bool(safe.get("apply_confirmed")),
+            "target_db": safe.get("apply_target_db") or "",
+            "event_log": safe.get("apply_event_log") or "",
+        },
+        "breakdowns": {
+            "source_category": dict(safe.get("breakdown_by_source_category") or {}),
+            "memory_type": dict(safe.get("breakdown_by_memory_type") or {}),
+            "scope": dict(safe.get("breakdown_by_scope") or {}),
+            "skip_reason": dict(by_reason),
+        },
+        "missing_source": bool(safe.get("missing_source")),
+        "warning": safe.get("warning") or "",
+        "candidates": list(safe.get("candidates") or []),
+    }
+
+
+def write_review_bundle(bundle: dict[str, Any], path: str | Path, *, overwrite: bool = False) -> Path:
+    p = validate_review_bundle_path(path, overwrite=overwrite)
+    p.write_text(
+        json.dumps(bundle, indent=2, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+    return p
+
+
 def apply_report(
     report: MigrationReport,
     *,
@@ -625,6 +708,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--event-log-path", help="JSONL event log path for --apply (must be explicit; real runtime log is rejected)")
     parser.add_argument("--include-review", action="store_true", help="Include requires_review candidates in --apply (still skips blocked/duplicates)")
     parser.add_argument("--confirm-apply", action="store_true", help="Required with --apply to prevent accidental writes")
+    parser.add_argument("--review-bundle-path", help="Write a safe JSON review bundle for human review (dry-run by default)")
+    parser.add_argument("--overwrite-review-bundle", action="store_true", help="Overwrite an existing review bundle path")
 
     try:
         args = parser.parse_args(argv)
@@ -686,6 +771,24 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         except Exception as e:
             print("ERROR: failed to apply migration report", file=sys.stderr)
+            _ = e
+            return 1
+
+    if args.review_bundle_path:
+        try:
+            bundle = build_review_bundle(report, include_content=bool(args.include_content))
+            out_path = write_review_bundle(
+                bundle,
+                args.review_bundle_path,
+                overwrite=bool(args.overwrite_review_bundle),
+            )
+            # Print to stderr so JSON stdout remains valid when --json is used.
+            print(f"Review bundle written: {out_path}", file=sys.stderr)
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
+        except Exception as e:
+            print("ERROR: failed to write review bundle", file=sys.stderr)
             _ = e
             return 1
 

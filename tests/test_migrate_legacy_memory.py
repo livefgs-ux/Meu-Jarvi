@@ -14,11 +14,14 @@ from tools.migrate_legacy_memory import (
     apply_privacy_check,
     apply_report,
     build_dry_run_report,
+    build_review_bundle,
     iter_legacy_items,
     load_legacy_memory,
     main,
     map_legacy_item,
     format_report,
+    validate_review_bundle_path,
+    write_review_bundle,
 )
 
 
@@ -50,6 +53,43 @@ class TestMigrateLegacyMemoryDryRun(unittest.TestCase):
             with self.assertRaises(ValueError) as ctx:
                 load_legacy_memory(p)
             self.assertIn("Invalid legacy JSON", str(ctx.exception))
+
+    def test_review_bundle_path_requires_json_extension(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "bundle.txt"
+            with self.assertRaises(ValueError):
+                _ = validate_review_bundle_path(p)
+
+    def test_review_bundle_parent_must_exist(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "nope" / "bundle.json"
+            with self.assertRaises(ValueError):
+                _ = validate_review_bundle_path(p)
+
+    def test_review_bundle_existing_file_requires_overwrite(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "bundle.json"
+            p.write_text("{}", encoding="utf-8")
+            with self.assertRaises(ValueError):
+                _ = validate_review_bundle_path(p, overwrite=False)
+            # overwrite=True should be allowed
+            _ = validate_review_bundle_path(p, overwrite=True)
+
+    def test_review_bundle_rejects_data_directory(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        p = repo_root / "data" / "bundle.json"
+        with self.assertRaises(ValueError):
+            _ = validate_review_bundle_path(p, overwrite=True)
+
+    def test_review_bundle_rejects_sensitive_paths(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        for p in [
+            repo_root / "config" / "api_keys.json",
+            repo_root / ".env",
+            repo_root / "memory" / "long_term.json",
+        ]:
+            with self.assertRaises(ValueError):
+                _ = validate_review_bundle_path(p, overwrite=True)
 
     def test_load_legacy_memory_missing_file_fails(self):
         with tempfile.TemporaryDirectory() as td:
@@ -403,6 +443,204 @@ class TestMigrateLegacyMemoryDryRun(unittest.TestCase):
             out = buf_out.getvalue()
             self.assertIn("Portuguese", out)
             self.assertNotIn(token, out)
+
+    def test_build_review_bundle_omits_content_by_default(self):
+        with tempfile.TemporaryDirectory() as td:
+            legacy_path = Path(td) / "legacy.json"
+            self._write_json(legacy_path, {"preferences": {"favorite_language": {"value": "Portuguese"}}})
+            report = build_dry_run_report(legacy_path, project="meu-jarvis")
+            bundle = build_review_bundle(report, include_content=False)
+            self.assertEqual(bundle.get("bundle_type"), "legacy_memory_migration_review")
+            self.assertFalse(bundle.get("content_included"))
+            # Candidates should not include content field by default.
+            for c in bundle.get("candidates", []):
+                self.assertNotIn("content", c)
+
+    def test_build_review_bundle_include_content_only_for_non_blocked(self):
+        with tempfile.TemporaryDirectory() as td:
+            legacy_path = Path(td) / "legacy.json"
+            token = "sk-THIS_IS_NOT_REAL_BUT_SHOULD_BLOCK_1234567890"
+            self._write_json(
+                legacy_path,
+                {
+                    "preferences": {"favorite_language": {"value": "Portuguese"}},
+                    "notes": {"api_key": {"value": token}},
+                },
+            )
+            report = build_dry_run_report(legacy_path, project="meu-jarvis")
+            bundle = build_review_bundle(report, include_content=True)
+            self.assertTrue(bundle.get("content_included"))
+            dumped = json.dumps(bundle, ensure_ascii=False)
+            self.assertIn("Portuguese", dumped)
+            self.assertNotIn(token, dumped)
+
+    def test_review_bundle_contains_summary_apply_breakdowns_candidates(self):
+        with tempfile.TemporaryDirectory() as td:
+            legacy_path = Path(td) / "legacy.json"
+            self._write_json(legacy_path, {"preferences": {"favorite_language": {"value": "Portuguese"}}})
+            report = build_dry_run_report(legacy_path, project="meu-jarvis")
+            bundle = build_review_bundle(report, include_content=False)
+            for k in ["summary", "apply", "breakdowns", "candidates", "bundle_type", "bundle_version"]:
+                self.assertIn(k, bundle)
+
+    def test_write_review_bundle_creates_safe_json_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            legacy_path = td_path / "legacy.json"
+            self._write_json(legacy_path, {"preferences": {"favorite_language": {"value": "Portuguese"}}})
+            report = build_dry_run_report(legacy_path, project="meu-jarvis")
+            bundle = build_review_bundle(report, include_content=False)
+            out_path = td_path / "bundle.json"
+            written = write_review_bundle(bundle, out_path, overwrite=False)
+            self.assertTrue(written.exists())
+            data = json.loads(written.read_text(encoding="utf-8"))
+            self.assertEqual(data.get("bundle_type"), "legacy_memory_migration_review")
+
+    def test_cli_writes_review_bundle_for_dry_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            legacy_path = td_path / "legacy.json"
+            self._write_json(legacy_path, {"preferences": {"favorite_language": {"value": "Portuguese"}}})
+            bundle_path = td_path / "review.json"
+            buf_out = io.StringIO()
+            buf_err = io.StringIO()
+            with redirect_stdout(buf_out), redirect_stderr(buf_err):
+                code = main(["--legacy-path", str(legacy_path), "--review-bundle-path", str(bundle_path)])
+            self.assertEqual(code, 0)
+            self.assertTrue(bundle_path.exists())
+            data = json.loads(bundle_path.read_text(encoding="utf-8"))
+            self.assertFalse(data["apply"]["requested"])
+            self.assertFalse((td_path / "mem.db").exists())
+            self.assertFalse((td_path / "events.jsonl").exists())
+
+    def test_cli_writes_review_bundle_after_confirmed_apply(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            legacy_path = td_path / "legacy.json"
+            self._write_json(legacy_path, {"preferences": {"favorite_language": {"value": "Portuguese"}}})
+            db_path = td_path / "mem.db"
+            log_path = td_path / "events.jsonl"
+            bundle_path = td_path / "review_apply.json"
+            buf_out = io.StringIO()
+            buf_err = io.StringIO()
+            with redirect_stdout(buf_out), redirect_stderr(buf_err):
+                code = main(
+                    [
+                        "--legacy-path",
+                        str(legacy_path),
+                        "--apply",
+                        "--confirm-apply",
+                        "--db-path",
+                        str(db_path),
+                        "--event-log-path",
+                        str(log_path),
+                        "--review-bundle-path",
+                        str(bundle_path),
+                    ]
+                )
+            self.assertEqual(code, 0)
+            self.assertTrue(db_path.exists())
+            self.assertTrue(log_path.exists())
+            self.assertTrue(bundle_path.exists())
+            data = json.loads(bundle_path.read_text(encoding="utf-8"))
+            self.assertTrue(data["apply"]["requested"])
+            self.assertTrue(data["apply"]["confirmed"])
+            self.assertGreaterEqual(data["summary"]["applied_items"], 1)
+
+    def test_cli_review_bundle_existing_file_without_overwrite_returns_2(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            legacy_path = td_path / "legacy.json"
+            self._write_json(legacy_path, {"preferences": {"favorite_language": {"value": "Portuguese"}}})
+            bundle_path = td_path / "review.json"
+            bundle_path.write_text("{}", encoding="utf-8")
+            buf_out = io.StringIO()
+            buf_err = io.StringIO()
+            with redirect_stdout(buf_out), redirect_stderr(buf_err):
+                code = main(["--legacy-path", str(legacy_path), "--review-bundle-path", str(bundle_path)])
+            self.assertEqual(code, 2)
+
+    def test_cli_review_bundle_existing_file_with_overwrite_succeeds(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            legacy_path = td_path / "legacy.json"
+            self._write_json(legacy_path, {"preferences": {"favorite_language": {"value": "Portuguese"}}})
+            bundle_path = td_path / "review.json"
+            bundle_path.write_text("{}", encoding="utf-8")
+            buf_out = io.StringIO()
+            buf_err = io.StringIO()
+            with redirect_stdout(buf_out), redirect_stderr(buf_err):
+                code = main(
+                    [
+                        "--legacy-path",
+                        str(legacy_path),
+                        "--review-bundle-path",
+                        str(bundle_path),
+                        "--overwrite-review-bundle",
+                    ]
+                )
+            self.assertEqual(code, 0)
+            data = json.loads(bundle_path.read_text(encoding="utf-8"))
+            self.assertEqual(data.get("bundle_type"), "legacy_memory_migration_review")
+
+    def test_cli_review_bundle_does_not_touch_real_data(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        real_db = repo_root / "data" / "jarvis_memory.db"
+        real_log = repo_root / "data" / "raw_events.jsonl"
+        before = []
+        for p in (real_db, real_log):
+            if p.exists():
+                st = p.stat()
+                before.append((p, st.st_size, st.st_mtime_ns))
+            else:
+                before.append((p, None, None))
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            legacy_path = td_path / "legacy.json"
+            self._write_json(legacy_path, {"preferences": {"favorite_language": {"value": "Portuguese"}}})
+            bundle_path = td_path / "review.json"
+            buf_out = io.StringIO()
+            buf_err = io.StringIO()
+            with redirect_stdout(buf_out), redirect_stderr(buf_err):
+                code = main(["--legacy-path", str(legacy_path), "--review-bundle-path", str(bundle_path)])
+            self.assertEqual(code, 0)
+        # Ensure no legacy long term created.
+        self.assertFalse((repo_root / "memory" / "long_term.json").exists())
+        # Ensure real runtime data files were not modified.
+        after = []
+        for p, _, _ in before:
+            if p.exists():
+                st = p.stat()
+                after.append((p, st.st_size, st.st_mtime_ns))
+            else:
+                after.append((p, None, None))
+        self.assertEqual(before, after)
+
+    def test_review_bundle_never_includes_blocked_content(self):
+        with tempfile.TemporaryDirectory() as td:
+            legacy_path = Path(td) / "legacy.json"
+            token = "sk-THIS_IS_NOT_REAL_BUT_SHOULD_BLOCK_1234567890"
+            self._write_json(legacy_path, {"notes": {"api_key": {"value": token}}})
+            report = build_dry_run_report(legacy_path, project="meu-jarvis")
+            bundle = build_review_bundle(report, include_content=True)
+            dumped = json.dumps(bundle, ensure_ascii=False)
+            self.assertNotIn(token, dumped)
+
+    def test_review_bundle_safe_when_allow_missing(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            missing = td_path / "missing.json"
+            bundle_path = td_path / "review_missing.json"
+            buf_out = io.StringIO()
+            buf_err = io.StringIO()
+            with redirect_stdout(buf_out), redirect_stderr(buf_err):
+                code = main(["--legacy-path", str(missing), "--allow-missing", "--review-bundle-path", str(bundle_path)])
+            self.assertEqual(code, 0)
+            self.assertTrue(bundle_path.exists())
+            data = json.loads(bundle_path.read_text(encoding="utf-8"))
+            self.assertTrue(data.get("missing_source"))
+            self.assertEqual(data["summary"]["total_items"], 0)
+            self.assertEqual(data.get("candidates"), [])
 
     def test_duplicate_candidates_are_marked_and_not_counted_as_migratable(self):
         with tempfile.TemporaryDirectory() as td:
