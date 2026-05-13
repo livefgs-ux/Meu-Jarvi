@@ -1,7 +1,9 @@
 import ast
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 from tools.migrate_legacy_memory import (
@@ -11,6 +13,7 @@ from tools.migrate_legacy_memory import (
     load_legacy_memory,
     main,
     map_legacy_item,
+    format_report,
 )
 
 
@@ -43,6 +46,16 @@ class TestMigrateLegacyMemoryDryRun(unittest.TestCase):
         items = iter_legacy_items(memory)
         cats = {i.category for i in items}
         self.assertTrue({"identity", "preferences", "projects", "relationships", "wishes", "notes"}.issubset(cats))
+
+    def test_iter_legacy_items_supports_list_bucket_for_duplicates(self):
+        memory = {
+            "preferences": [
+                {"key": "favorite_language", "value": "Portuguese"},
+                {"key": "favorite_language", "value": "Portuguese"},
+            ]
+        }
+        items = iter_legacy_items(memory)
+        self.assertEqual(len(items), 2)
 
     def test_map_preferences_to_global_preference_candidate(self):
         it = iter_legacy_items({"preferences": {"favorite_language": {"value": "Portuguese"}}})[0]
@@ -100,20 +113,33 @@ class TestMigrateLegacyMemoryDryRun(unittest.TestCase):
             self.assertNotIn("create_memory", src)
             self.assertNotIn("update_memory_status", src)
             self.assertNotIn("archive_memory", src)
+            self.assertNotIn("import sqlite3", src)
+            self.assertNotIn("memory_engine.writer", src)
+            self.assertNotIn("open_db", src)
+            self.assertNotIn("init_db", src)
+            self.assertNotIn("append_event", src)
 
     def test_cli_dry_run_success(self):
         with tempfile.TemporaryDirectory() as td:
             legacy_path = Path(td) / "legacy.json"
             self._write_json(legacy_path, {"preferences": {"favorite_language": {"value": "Portuguese"}}})
-            code = main(["--legacy-path", str(legacy_path)])
+            buf_out = io.StringIO()
+            buf_err = io.StringIO()
+            with redirect_stdout(buf_out), redirect_stderr(buf_err):
+                code = main(["--legacy-path", str(legacy_path)])
             self.assertEqual(code, 0)
+            self.assertEqual(buf_err.getvalue(), "")
 
     def test_cli_apply_is_rejected(self):
         with tempfile.TemporaryDirectory() as td:
             legacy_path = Path(td) / "legacy.json"
             self._write_json(legacy_path, {"preferences": {"favorite_language": {"value": "Portuguese"}}})
-            code = main(["--legacy-path", str(legacy_path), "--apply"])
+            buf_out = io.StringIO()
+            buf_err = io.StringIO()
+            with redirect_stdout(buf_out), redirect_stderr(buf_err):
+                code = main(["--legacy-path", str(legacy_path), "--apply"])
             self.assertEqual(code, 2)
+            self.assertIn("not implemented", buf_err.getvalue().lower())
 
     def test_unknown_category_becomes_review_candidate(self):
         it = iter_legacy_items({"unknown": {"x": {"value": "Y"}}})[0]
@@ -121,6 +147,7 @@ class TestMigrateLegacyMemoryDryRun(unittest.TestCase):
         self.assertEqual(cand.memory_type, "IDEA")
         self.assertEqual(cand.scope, "project:meu-jarvis")
         self.assertTrue(cand.requires_review)
+        self.assertTrue(cand.unknown_category)
 
     def test_empty_values_are_ignored(self):
         items = iter_legacy_items({"preferences": {"empty": {"value": ""}, "blank": ""}})
@@ -136,7 +163,96 @@ class TestMigrateLegacyMemoryDryRun(unittest.TestCase):
                 for alias in node.names:
                     self.assertNotEqual(alias.name, "memory_engine.writer")
 
+    def test_text_report_does_not_include_candidate_content_by_default(self):
+        with tempfile.TemporaryDirectory() as td:
+            legacy_path = Path(td) / "legacy.json"
+            # Non-secret but sensitive-like value.
+            self._write_json(legacy_path, {"notes": {"private_note": {"value": "My private preference text"}}})
+            report = build_dry_run_report(legacy_path, project="meu-jarvis")
+            txt = format_report(report)
+            self.assertNotIn("My private preference text", txt)
+
+    def test_text_report_omits_blocked_content(self):
+        with tempfile.TemporaryDirectory() as td:
+            legacy_path = Path(td) / "legacy.json"
+            token = "sk-THIS_IS_NOT_REAL_BUT_SHOULD_BLOCK_1234567890"
+            self._write_json(legacy_path, {"notes": {"api_key": {"value": token}}})
+            report = build_dry_run_report(legacy_path, project="meu-jarvis")
+            txt = format_report(report)
+            self.assertNotIn(token, txt)
+            self.assertIn("Blocked items (content omitted)", txt)
+
+    def test_json_report_omits_content_by_default(self):
+        with tempfile.TemporaryDirectory() as td:
+            legacy_path = Path(td) / "legacy.json"
+            self._write_json(legacy_path, {"notes": {"private_note": {"value": "My private preference text"}}})
+            buf_out = io.StringIO()
+            buf_err = io.StringIO()
+            with redirect_stdout(buf_out), redirect_stderr(buf_err):
+                code = main(["--legacy-path", str(legacy_path), "--json"])
+            self.assertEqual(code, 0)
+            out = buf_out.getvalue()
+            self.assertNotIn("My private preference text", out)
+            self.assertNotIn("\"content\"", out)
+
+    def test_json_include_content_includes_only_non_blocked_content(self):
+        with tempfile.TemporaryDirectory() as td:
+            legacy_path = Path(td) / "legacy.json"
+            token = "sk-THIS_IS_NOT_REAL_BUT_SHOULD_BLOCK_1234567890"
+            self._write_json(
+                legacy_path,
+                {
+                    "preferences": {"favorite_language": {"value": "Portuguese"}},
+                    "notes": {"api_key": {"value": token}},
+                },
+            )
+            buf_out = io.StringIO()
+            buf_err = io.StringIO()
+            with redirect_stdout(buf_out), redirect_stderr(buf_err):
+                code = main(["--legacy-path", str(legacy_path), "--json", "--include-content"])
+            self.assertEqual(code, 0)
+            out = buf_out.getvalue()
+            self.assertIn("Portuguese", out)
+            self.assertNotIn(token, out)
+
+    def test_duplicate_candidates_are_marked_and_not_counted_as_migratable(self):
+        with tempfile.TemporaryDirectory() as td:
+            legacy_path = Path(td) / "legacy.json"
+            # Use list bucket to create duplicates.
+            self._write_json(
+                legacy_path,
+                {
+                    "preferences": [
+                        {"key": "favorite_language", "value": "Portuguese"},
+                        {"key": "favorite_language", "value": "Portuguese"},
+                    ]
+                },
+            )
+            report = build_dry_run_report(legacy_path, project="meu-jarvis")
+            self.assertGreaterEqual(report.duplicate_items, 1)
+            dups = [c for c in report.candidates if c.duplicate]
+            self.assertTrue(dups)
+            # migratable excludes duplicates
+            self.assertEqual(
+                report.migratable_items,
+                sum(1 for c in report.candidates if (not c.blocked) and (not c.duplicate)),
+            )
+
+    def test_report_breakdown_by_category_type_scope(self):
+        with tempfile.TemporaryDirectory() as td:
+            legacy_path = Path(td) / "legacy.json"
+            self._write_json(
+                legacy_path,
+                {
+                    "preferences": {"favorite_language": {"value": "Portuguese"}},
+                    "projects": {"meu_jarvis": {"value": "Local assistant project"}},
+                },
+            )
+            report = build_dry_run_report(legacy_path, project="meu-jarvis")
+            self.assertIn("preferences", report.by_source_category)
+            self.assertIn("PREFERENCE", report.by_memory_type)
+            self.assertIn("global", report.by_scope)
+
 
 if __name__ == "__main__":
     unittest.main()
-

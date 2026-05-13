@@ -7,7 +7,7 @@ Safety:
 - Does NOT write to SQLite.
 - Does NOT write to JSONL event logs.
 - Does NOT modify legacy JSON.
-- Does NOT call memory_engine.writer.*.
+  - Does NOT call the Memory Engine writer module.
 - Rejects --apply (not implemented in Phase 1A).
 """
 
@@ -47,6 +47,9 @@ class MigrationCandidate:
     requires_review: bool
     blocked: bool
     block_reason: str
+    duplicate: bool = False
+    duplicate_of: str = ""
+    unknown_category: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +58,11 @@ class MigrationReport:
     migratable_items: int
     blocked_items: int
     review_required_items: int
+    duplicate_items: int
+    by_source_category: dict[str, int]
+    by_memory_type: dict[str, int]
+    by_scope: dict[str, int]
+    unknown_categories: list[str]
     candidates: list[MigrationCandidate]
 
 
@@ -92,14 +100,29 @@ def iter_legacy_items(memory: dict[str, Any]) -> list[LegacyMemoryItem]:
         if bucket is None:
             continue
         cat = str(category).strip()
-        if not isinstance(bucket, dict):
+        if isinstance(bucket, dict):
+            for key, raw in bucket.items():
+                k = str(key).strip()
+                v = _coerce_value_to_str(raw)
+                if not k or not v:
+                    continue
+                items.append(LegacyMemoryItem(category=cat, key=k, value=v))
             continue
-        for key, raw in bucket.items():
-            k = str(key).strip()
-            v = _coerce_value_to_str(raw)
-            if not k or not v:
-                continue
-            items.append(LegacyMemoryItem(category=cat, key=k, value=v))
+
+        # Some legacy exports may represent items as a list of {key,value} objects.
+        if isinstance(bucket, list):
+            for raw_item in bucket:
+                if not isinstance(raw_item, dict):
+                    continue
+                k = str(raw_item.get("key", "")).strip()
+                v = _coerce_value_to_str(raw_item.get("value"))
+                if not k or not v:
+                    continue
+                items.append(LegacyMemoryItem(category=cat, key=k, value=v))
+            continue
+
+        # Unknown bucket shape: ignore.
+        continue
     return items
 
 
@@ -119,37 +142,44 @@ def map_legacy_item(item: LegacyMemoryItem, project: str = "meu-jarvis") -> Migr
         scope = "global"
         proj: str | None = None
         requires_review = False
+        unknown_category = False
     elif cat == "projects":
         memory_type = "PROJECT_CONTEXT"
         scope = f"project:{project}"
         proj = project
         requires_review = False
+        unknown_category = False
     elif cat == "notes":
         memory_type = "IDEA"
         scope = f"project:{project}"
         proj = project
         requires_review = True
+        unknown_category = False
     elif cat == "wishes":
         memory_type = "IDEA"
         scope = "global"
         proj = None
         requires_review = True
+        unknown_category = False
     elif cat == "identity":
         memory_type = "PREFERENCE"
         scope = "global"
         proj = None
         requires_review = True
+        unknown_category = False
     elif cat == "relationships":
         memory_type = "PREFERENCE"
         scope = "global"
         proj = None
         requires_review = True
+        unknown_category = False
     else:
         # Unknown categories become review candidates.
         memory_type = "IDEA"
         scope = f"project:{project}"
         proj = project
         requires_review = True
+        unknown_category = True
 
     content = f"{cat}.{key}: {item.value}"
 
@@ -166,6 +196,9 @@ def map_legacy_item(item: LegacyMemoryItem, project: str = "meu-jarvis") -> Migr
         requires_review=requires_review,
         blocked=blocked,
         block_reason=block_reason,
+        duplicate=False,
+        duplicate_of="",
+        unknown_category=unknown_category,
     )
 
 
@@ -186,7 +219,47 @@ def apply_privacy_check(candidate: MigrationCandidate) -> MigrationCandidate:
         requires_review=candidate.requires_review,
         blocked=True,
         block_reason=result.reason or "Blocked by privacy guard",
+        duplicate=candidate.duplicate,
+        duplicate_of=candidate.duplicate_of,
+        unknown_category=candidate.unknown_category,
     )
+
+
+def _normalize_content_for_dedupe(content: str) -> str:
+    text = (content or "").strip().lower()
+    return " ".join(text.split())
+
+
+def _apply_dedupe(candidates: list[MigrationCandidate]) -> list[MigrationCandidate]:
+    seen: dict[str, MigrationCandidate] = {}
+    out: list[MigrationCandidate] = []
+    for c in candidates:
+        key = f"{c.memory_type}|{c.scope}|{_normalize_content_for_dedupe(c.content)}"
+        if key in seen:
+            first = seen[key]
+            out.append(
+                MigrationCandidate(
+                    source_category=c.source_category,
+                    source_key=c.source_key,
+                    content=c.content,
+                    memory_type=c.memory_type,
+                    scope=c.scope,
+                    project=c.project,
+                    status=c.status,
+                    importance=c.importance,
+                    confidence=c.confidence,
+                    requires_review=c.requires_review,
+                    blocked=c.blocked,
+                    block_reason=c.block_reason,
+                    duplicate=True,
+                    duplicate_of=f"{first.source_category}.{first.source_key}",
+                    unknown_category=c.unknown_category,
+                )
+            )
+        else:
+            seen[key] = c
+            out.append(c)
+    return out
 
 
 def build_dry_run_report(path: str | Path, project: str = "meu-jarvis") -> MigrationReport:
@@ -199,16 +272,35 @@ def build_dry_run_report(path: str | Path, project: str = "meu-jarvis") -> Migra
         cand = apply_privacy_check(cand)
         candidates.append(cand)
 
+    candidates = _apply_dedupe(candidates)
+
     total = len(candidates)
     blocked = sum(1 for c in candidates if c.blocked)
+    duplicates = sum(1 for c in candidates if c.duplicate)
     review_required = sum(1 for c in candidates if c.requires_review and not c.blocked)
-    migratable = sum(1 for c in candidates if not c.blocked)
+    migratable = sum(1 for c in candidates if (not c.blocked) and (not c.duplicate))
+
+    by_cat: dict[str, int] = {}
+    by_type: dict[str, int] = {}
+    by_scope: dict[str, int] = {}
+    unknown: set[str] = set()
+    for c in candidates:
+        by_cat[c.source_category] = by_cat.get(c.source_category, 0) + 1
+        by_type[c.memory_type] = by_type.get(c.memory_type, 0) + 1
+        by_scope[c.scope] = by_scope.get(c.scope, 0) + 1
+        if c.unknown_category:
+            unknown.add(c.source_category)
 
     return MigrationReport(
         total_items=total,
         migratable_items=migratable,
         blocked_items=blocked,
         review_required_items=review_required,
+        duplicate_items=duplicates,
+        by_source_category=by_cat,
+        by_memory_type=by_type,
+        by_scope=by_scope,
+        unknown_categories=sorted(unknown),
         candidates=candidates,
     )
 
@@ -220,16 +312,25 @@ def format_report(report: MigrationReport) -> str:
     lines.append(f"Migratable: {report.migratable_items}")
     lines.append(f"Blocked (privacy): {report.blocked_items}")
     lines.append(f"Requires review: {report.review_required_items}")
+    lines.append(f"Duplicates: {report.duplicate_items}")
 
-    # Category breakdown.
-    by_cat: dict[str, int] = {}
-    for c in report.candidates:
-        by_cat[c.source_category] = by_cat.get(c.source_category, 0) + 1
-    if by_cat:
+    if report.by_source_category:
         lines.append("")
-        lines.append("By category:")
-        for k in sorted(by_cat):
-            lines.append(f"- {k}: {by_cat[k]}")
+        lines.append("By source category:")
+        for k in sorted(report.by_source_category):
+            lines.append(f"- {k}: {report.by_source_category[k]}")
+
+    if report.by_memory_type:
+        lines.append("")
+        lines.append("By memory type:")
+        for k in sorted(report.by_memory_type):
+            lines.append(f"- {k}: {report.by_memory_type[k]}")
+
+    if report.by_scope:
+        lines.append("")
+        lines.append("By scope:")
+        for k in sorted(report.by_scope):
+            lines.append(f"- {k}: {report.by_scope[k]}")
 
     blocked = [c for c in report.candidates if c.blocked]
     if blocked:
@@ -240,35 +341,60 @@ def format_report(report: MigrationReport) -> str:
         if len(blocked) > 50:
             lines.append(f"... ({len(blocked) - 50} more)")
 
+    if report.unknown_categories:
+        lines.append("")
+        lines.append("Unknown categories:")
+        for cat in report.unknown_categories[:50]:
+            lines.append(f"- {cat}")
+        if len(report.unknown_categories) > 50:
+            lines.append(f"... ({len(report.unknown_categories) - 50} more)")
+
+    unknown_items = [c for c in report.candidates if c.unknown_category]
+    if unknown_items:
+        lines.append("")
+        lines.append("Unknown category items (value omitted):")
+        for c in unknown_items[:50]:
+            lines.append(f"- {c.source_category}.{c.source_key}")
+        if len(unknown_items) > 50:
+            lines.append(f"... ({len(unknown_items) - 50} more)")
+
     return "\n".join(lines).rstrip() + "\n"
 
 
-def _report_to_safe_json(report: MigrationReport) -> dict[str, Any]:
-    # Safe JSON output: do not include content for blocked items.
+def _report_to_safe_json(report: MigrationReport, *, include_content: bool) -> dict[str, Any]:
+    # Safe JSON output: content omitted by default; never include blocked content.
     out = {
         "total_items": report.total_items,
         "migratable_items": report.migratable_items,
         "blocked_items": report.blocked_items,
         "review_required_items": report.review_required_items,
+        "duplicate_items": report.duplicate_items,
+        "by_source_category": dict(report.by_source_category),
+        "by_memory_type": dict(report.by_memory_type),
+        "by_scope": dict(report.by_scope),
+        "unknown_categories": list(report.unknown_categories),
         "candidates": [],
     }
     for c in report.candidates:
-        out["candidates"].append(
-            {
-                "source_category": c.source_category,
-                "source_key": c.source_key,
-                "memory_type": c.memory_type,
-                "scope": c.scope,
-                "project": c.project,
-                "status": c.status,
-                "importance": c.importance,
-                "confidence": c.confidence,
-                "requires_review": c.requires_review,
-                "blocked": c.blocked,
-                "block_reason": c.block_reason,
-                "content": "" if c.blocked else c.content,
-            }
-        )
+        item = {
+            "source_category": c.source_category,
+            "source_key": c.source_key,
+            "memory_type": c.memory_type,
+            "scope": c.scope,
+            "project": c.project,
+            "status": c.status,
+            "importance": c.importance,
+            "confidence": c.confidence,
+            "requires_review": c.requires_review,
+            "blocked": c.blocked,
+            "block_reason": c.block_reason,
+            "duplicate": c.duplicate,
+            "duplicate_of": c.duplicate_of,
+            "unknown_category": c.unknown_category,
+        }
+        if include_content and (not c.blocked):
+            item["content"] = c.content
+        out["candidates"].append(item)
     return out
 
 
@@ -278,6 +404,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--project", default="meu-jarvis", help="Project name used for project:<name> scopes")
     parser.add_argument("--dry-run", action="store_true", default=True, help="Dry-run only (default)")
     parser.add_argument("--json", action="store_true", help="Print JSON report (safe output)")
+    parser.add_argument("--include-content", action="store_true", help="Include content in JSON for non-blocked items only")
     parser.add_argument("--apply", action="store_true", help="NOT IMPLEMENTED in Phase 1A (dry-run only)")
 
     try:
@@ -305,7 +432,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.json:
-        print(json.dumps(_report_to_safe_json(report), indent=2, ensure_ascii=False, sort_keys=True))
+        print(json.dumps(_report_to_safe_json(report, include_content=bool(args.include_content)), indent=2, ensure_ascii=False, sort_keys=True))
     else:
         print(format_report(report), end="")
     return 0
@@ -313,4 +440,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
