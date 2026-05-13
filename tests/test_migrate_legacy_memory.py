@@ -1,6 +1,8 @@
 import ast
 import io
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -333,6 +335,63 @@ class TestMigrateLegacyMemoryDryRun(unittest.TestCase):
                 code = main(["--legacy-path", missing, "--allow-missing", "--apply"])
             self.assertEqual(code, 2)
             self.assertIn("apply", buf_err.getvalue().lower())
+
+    def test_direct_script_execution_allow_missing(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as td:
+            missing = Path(td) / "missing.json"
+            self.assertFalse(missing.exists())
+            cmd = [
+                sys.executable,
+                str(repo_root / "tools" / "migrate_legacy_memory.py"),
+                "--legacy-path",
+                str(missing),
+                "--project",
+                "meu-jarvis",
+                "--allow-missing",
+            ]
+            proc = subprocess.run(cmd, cwd=str(repo_root), capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0)
+            self.assertIn("nothing to migrate", proc.stdout.lower())
+            self.assertFalse(missing.exists())
+
+    def test_module_execution_allow_missing(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as td:
+            missing = Path(td) / "missing.json"
+            self.assertFalse(missing.exists())
+            cmd = [
+                sys.executable,
+                "-m",
+                "tools.migrate_legacy_memory",
+                "--legacy-path",
+                str(missing),
+                "--project",
+                "meu-jarvis",
+                "--allow-missing",
+            ]
+            proc = subprocess.run(cmd, cwd=str(repo_root), capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0)
+            self.assertIn("nothing to migrate", proc.stdout.lower())
+            self.assertFalse(missing.exists())
+
+    def test_direct_script_execution_without_allow_missing_returns_2(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as td:
+            missing = Path(td) / "missing.json"
+            self.assertFalse(missing.exists())
+            cmd = [
+                sys.executable,
+                str(repo_root / "tools" / "migrate_legacy_memory.py"),
+                "--legacy-path",
+                str(missing),
+                "--project",
+                "meu-jarvis",
+            ]
+            proc = subprocess.run(cmd, cwd=str(repo_root), capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 2)
+            self.assertIn("not found", (proc.stderr or proc.stdout).lower())
+            self.assertFalse(missing.exists())
 
 
 if __name__ == "__main__":

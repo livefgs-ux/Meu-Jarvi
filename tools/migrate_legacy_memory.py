@@ -20,6 +20,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+# When executed directly (python tools/migrate_legacy_memory.py), Python's import base
+# is the tools/ directory, so project-root imports like "memory_engine" may fail.
+# Keep behavior identical; just ensure imports resolve in direct-script mode.
+if __package__ in {None, ""}:
+    _repo_root = Path(__file__).resolve().parent.parent
+    _repo_root_str = str(_repo_root)
+    if _repo_root_str not in sys.path:
+        sys.path.insert(0, _repo_root_str)
+
 from memory_engine.privacy_guard import check_content_safe
 
 
