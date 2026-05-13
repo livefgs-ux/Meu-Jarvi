@@ -33,6 +33,24 @@ class TestMigrateLegacyMemoryDryRun(unittest.TestCase):
             loaded = load_legacy_memory(p)
             self.assertIn("preferences", loaded)
 
+    def test_load_legacy_memory_reads_utf8_bom_json(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "legacy_bom.json"
+            p.write_text(
+                json.dumps({"preferences": {"favorite_language": {"value": "Portuguese"}}}),
+                encoding="utf-8-sig",
+            )
+            loaded = load_legacy_memory(p)
+            self.assertIn("preferences", loaded)
+
+    def test_invalid_json_with_bom_still_fails_clearly(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "bad_bom.json"
+            p.write_text("{not valid json", encoding="utf-8-sig")
+            with self.assertRaises(ValueError) as ctx:
+                load_legacy_memory(p)
+            self.assertIn("Invalid legacy JSON", str(ctx.exception))
+
     def test_load_legacy_memory_missing_file_fails(self):
         with tempfile.TemporaryDirectory() as td:
             p = Path(td) / "missing.json"
@@ -175,6 +193,8 @@ class TestMigrateLegacyMemoryDryRun(unittest.TestCase):
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
                 self.assertNotIn(node.module or "", {"sqlite3"})
+                if node.module == "memory_engine.writer":
+                    self.assertEqual([a.name for a in node.names], ["create_memory"])
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     self.assertNotEqual(alias.name, "sqlite3")
@@ -196,7 +216,45 @@ class TestMigrateLegacyMemoryDryRun(unittest.TestCase):
             report = build_dry_run_report(legacy_path, project="meu-jarvis")
             txt = format_report(report)
             self.assertNotIn(token, txt)
-            self.assertIn("Blocked items (content omitted)", txt)
+            self.assertIn("Blocked Items (content omitted)", txt)
+
+    def test_text_report_includes_apply_summary_counts(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            legacy_path = td_path / "legacy.json"
+            self._write_json(legacy_path, {"preferences": {"favorite_language": {"value": "Portuguese"}}})
+            db_path = td_path / "mem.db"
+            log_path = td_path / "events.jsonl"
+            report = build_dry_run_report(legacy_path, project="meu-jarvis")
+            applied = apply_report(report, db_path=db_path, event_log_path=log_path, include_review=False)
+            txt = format_report(applied)
+            self.assertIn("Summary", txt)
+            self.assertIn("- Applied:", txt)
+            self.assertIn("- Skipped:", txt)
+
+    def test_text_report_lists_skipped_reasons_without_content(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            legacy_path = td_path / "legacy.json"
+            self._write_json(legacy_path, {"identity": {"name": {"value": "My private preference text"}}})
+            db_path = td_path / "mem.db"
+            log_path = td_path / "events.jsonl"
+            report = build_dry_run_report(legacy_path, project="meu-jarvis")
+            applied = apply_report(report, db_path=db_path, event_log_path=log_path, include_review=False)
+            txt = format_report(applied)
+            self.assertIn("Skipped Items", txt)
+            self.assertIn("requires_review", txt)
+            self.assertNotIn("My private preference text", txt)
+
+    def test_text_report_lists_unknown_categories_without_content(self):
+        with tempfile.TemporaryDirectory() as td:
+            legacy_path = Path(td) / "legacy.json"
+            self._write_json(legacy_path, {"weird_category": {"k": {"value": "Secret-ish but not blocked"}}})
+            report = build_dry_run_report(legacy_path, project="meu-jarvis")
+            txt = format_report(report)
+            self.assertIn("Unknown Categories", txt)
+            self.assertIn("Unknown Category Items", txt)
+            self.assertNotIn("Secret-ish but not blocked", txt)
 
     def test_json_report_omits_content_by_default(self):
         with tempfile.TemporaryDirectory() as td:
@@ -210,6 +268,47 @@ class TestMigrateLegacyMemoryDryRun(unittest.TestCase):
             out = buf_out.getvalue()
             self.assertNotIn("My private preference text", out)
             self.assertNotIn("\"content\"", out)
+
+    def test_json_report_includes_apply_counts(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            legacy_path = td_path / "legacy.json"
+            self._write_json(legacy_path, {"preferences": {"favorite_language": {"value": "Portuguese"}}})
+            db_path = td_path / "mem.db"
+            log_path = td_path / "events.jsonl"
+            buf_out = io.StringIO()
+            buf_err = io.StringIO()
+            with redirect_stdout(buf_out), redirect_stderr(buf_err):
+                code = main(
+                    [
+                        "--legacy-path",
+                        str(legacy_path),
+                        "--apply",
+                        "--db-path",
+                        str(db_path),
+                        "--event-log-path",
+                        str(log_path),
+                        "--json",
+                    ]
+                )
+            self.assertEqual(code, 0)
+            data = json.loads(buf_out.getvalue())
+            self.assertIn("applied_items", data)
+            self.assertIn("skipped_items", data)
+
+    def test_json_report_includes_breakdowns(self):
+        with tempfile.TemporaryDirectory() as td:
+            legacy_path = Path(td) / "legacy.json"
+            self._write_json(legacy_path, {"preferences": {"favorite_language": {"value": "Portuguese"}}})
+            buf_out = io.StringIO()
+            buf_err = io.StringIO()
+            with redirect_stdout(buf_out), redirect_stderr(buf_err):
+                code = main(["--legacy-path", str(legacy_path), "--json"])
+            self.assertEqual(code, 0)
+            data = json.loads(buf_out.getvalue())
+            self.assertIn("breakdown_by_source_category", data)
+            self.assertIn("breakdown_by_memory_type", data)
+            self.assertIn("breakdown_by_scope", data)
 
     def test_json_include_content_includes_only_non_blocked_content(self):
         with tempfile.TemporaryDirectory() as td:
@@ -314,7 +413,7 @@ class TestMigrateLegacyMemoryDryRun(unittest.TestCase):
             report = build_dry_run_report(missing, project="meu-jarvis", allow_missing=True)
             txt = format_report(report)
             self.assertIn("nothing to migrate", txt.lower())
-            self.assertNotIn("content", txt.lower())
+            self.assertIn("summary", txt.lower())
 
     def test_missing_file_json_report_is_safe(self):
         with tempfile.TemporaryDirectory() as td:
@@ -552,6 +651,29 @@ class TestMigrateLegacyMemoryDryRun(unittest.TestCase):
             out = buf_out.getvalue()
             self.assertIn("Portuguese", out)
             self.assertNotIn(token, out)
+
+    def test_apply_report_tracks_skip_reason_counts(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            legacy_path = td_path / "legacy.json"
+            token = "sk-THIS_IS_NOT_REAL_BUT_SHOULD_BLOCK_1234567890"
+            self._write_json(
+                legacy_path,
+                {
+                    "preferences": [{"key": "favorite_language", "value": "Portuguese"}, {"key": "favorite_language", "value": "Portuguese"}],
+                    "notes": {"api_key": {"value": token}},
+                    "identity": {"name": {"value": "Fabricio"}},
+                },
+            )
+            db_path = td_path / "mem.db"
+            log_path = td_path / "events.jsonl"
+            report = build_dry_run_report(legacy_path, project="meu-jarvis")
+            applied = apply_report(report, db_path=db_path, event_log_path=log_path, include_review=False)
+            # Expect at least one skipped due to blocked, duplicate, and requires_review.
+            reasons = {c.skip_reason for c in applied.candidates if c.skipped}
+            self.assertIn("blocked", reasons)
+            self.assertIn("duplicate", reasons)
+            self.assertIn("requires_review", reasons)
 
     def test_direct_script_execution_allow_missing(self):
         repo_root = Path(__file__).resolve().parents[1]

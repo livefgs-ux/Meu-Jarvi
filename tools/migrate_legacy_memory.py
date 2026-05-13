@@ -188,7 +188,8 @@ def load_legacy_memory(path: str | Path) -> dict[str, Any]:
     if not p.exists():
         raise FileNotFoundError(f"Legacy memory file not found: {str(p)}")
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
+        # utf-8-sig handles Windows-generated UTF-8 BOM transparently.
+        data = json.loads(p.read_text(encoding="utf-8-sig"))
     except json.JSONDecodeError as e:
         raise ValueError(f"Invalid legacy JSON: {e}") from e
     if not isinstance(data, dict):
@@ -436,48 +437,70 @@ def build_dry_run_report(
 
 def format_report(report: MigrationReport) -> str:
     lines: list[str] = []
-    lines.append("Legacy Memory Migration Dry-Run Report")
+    lines.append("Legacy Memory Migration Report")
+
     if report.missing_source and report.warning:
-        lines.append(f"WARNING: {report.warning}")
-    if report.applied_items or report.skipped_items:
-        lines.append(f"Applied: {report.applied_items}")
-        lines.append(f"Skipped: {report.skipped_items}")
-    lines.append(f"Total items: {report.total_items}")
-    lines.append(f"Migratable: {report.migratable_items}")
-    lines.append(f"Blocked (privacy): {report.blocked_items}")
-    lines.append(f"Requires review: {report.review_required_items}")
-    lines.append(f"Duplicates: {report.duplicate_items}")
+        lines.append("")
+        lines.append("Missing Source")
+        lines.append(f"- {report.warning}")
+
+    # Summary
+    lines.append("")
+    lines.append("Summary")
+    lines.append(f"- Total items: {report.total_items}")
+    lines.append(f"- Migratable: {report.migratable_items}")
+    lines.append(f"- Blocked: {report.blocked_items}")
+    lines.append(f"- Requires review: {report.review_required_items}")
+    lines.append(f"- Duplicates: {report.duplicate_items}")
+    lines.append(f"- Applied: {report.applied_items}")
+    lines.append(f"- Skipped: {report.skipped_items}")
 
     if report.by_source_category:
         lines.append("")
-        lines.append("By source category:")
+        lines.append("Breakdown by Source Category")
         for k in sorted(report.by_source_category):
             lines.append(f"- {k}: {report.by_source_category[k]}")
 
     if report.by_memory_type:
         lines.append("")
-        lines.append("By memory type:")
+        lines.append("Breakdown by Memory Type")
         for k in sorted(report.by_memory_type):
             lines.append(f"- {k}: {report.by_memory_type[k]}")
 
     if report.by_scope:
         lines.append("")
-        lines.append("By scope:")
+        lines.append("Breakdown by Scope")
         for k in sorted(report.by_scope):
             lines.append(f"- {k}: {report.by_scope[k]}")
 
     blocked = [c for c in report.candidates if c.blocked]
     if blocked:
         lines.append("")
-        lines.append("Blocked items (content omitted):")
+        lines.append("Blocked Items (content omitted)")
         for c in blocked[:50]:
             lines.append(f"- {c.source_category}.{c.source_key}: {c.block_reason}")
         if len(blocked) > 50:
             lines.append(f"... ({len(blocked) - 50} more)")
 
+    skipped_items = [c for c in report.candidates if c.skipped]
+    if skipped_items:
+        lines.append("")
+        lines.append("Skipped Items (content omitted)")
+        # Optional: show skip reason counts first.
+        by_reason: dict[str, int] = {}
+        for c in skipped_items:
+            r = c.skip_reason or "unknown"
+            by_reason[r] = by_reason.get(r, 0) + 1
+        for r in sorted(by_reason):
+            lines.append(f"- {r}: {by_reason[r]}")
+        for c in skipped_items[:50]:
+            lines.append(f"- {c.source_category}.{c.source_key}: {c.skip_reason}")
+        if len(skipped_items) > 50:
+            lines.append(f"... ({len(skipped_items) - 50} more)")
+
     if report.unknown_categories:
         lines.append("")
-        lines.append("Unknown categories:")
+        lines.append("Unknown Categories")
         for cat in report.unknown_categories[:50]:
             lines.append(f"- {cat}")
         if len(report.unknown_categories) > 50:
@@ -486,7 +509,7 @@ def format_report(report: MigrationReport) -> str:
     unknown_items = [c for c in report.candidates if c.unknown_category]
     if unknown_items:
         lines.append("")
-        lines.append("Unknown category items (value omitted):")
+        lines.append("Unknown Category Items (value omitted)")
         for c in unknown_items[:50]:
             lines.append(f"- {c.source_category}.{c.source_key}")
         if len(unknown_items) > 50:
@@ -507,6 +530,10 @@ def _report_to_safe_json(report: MigrationReport, *, include_content: bool) -> d
         "duplicate_items": report.duplicate_items,
         "applied_items": report.applied_items,
         "skipped_items": report.skipped_items,
+        # Keep explicit "breakdown_*" keys; also keep legacy "by_*" for compatibility.
+        "breakdown_by_source_category": dict(report.by_source_category),
+        "breakdown_by_memory_type": dict(report.by_memory_type),
+        "breakdown_by_scope": dict(report.by_scope),
         "by_source_category": dict(report.by_source_category),
         "by_memory_type": dict(report.by_memory_type),
         "by_scope": dict(report.by_scope),
