@@ -101,6 +101,7 @@ Observacao: este projeto nao carrega `.env` automaticamente. Essas variaveis dev
 - `docs/PROJECT_CONTEXT.md`
 - `docs/ARCHITECTURE.md`
 - `docs/MEMORY_ENGINE.md`
+- `docs/MEMORY_MIGRATION_CLI.md` (safe offline legacy memory migration CLI)
 - `docs/ACTIONS_AND_TOOLS.md`
 - `docs/SECURITY_MODEL.md`
 - `docs/CODEX_WORKFLOW.md`

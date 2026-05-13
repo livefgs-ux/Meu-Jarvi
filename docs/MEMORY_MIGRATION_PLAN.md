@@ -19,6 +19,23 @@ Estado confirmado no codigo local:
   1. time context
   2. legacy memory string (se existir)
   3. read-only memory context (se env permitir)
+
+## Implemented Tooling Status
+O tooling offline de migracao ja existe e e seguro para revisao/testes locais:
+- dry-run com saida segura por padrao
+- `--allow-missing` para arquivo legado ausente (relatorio vazio seguro)
+- apply controlado para paths explicitos de teste:
+  - `--apply --confirm-apply --db-path ... --event-log-path ...`
+  - paths reais em `data/` sao rejeitados
+- suporte a JSON legado com BOM UTF-8 (`utf-8-sig`)
+- export de review bundle seguro para revisao humana:
+  - `--review-bundle-path ...` (seguro por padrao; content omitido a menos que solicitado explicitamente)
+
+Importante:
+- o DB/log runtime reais em `data/` continuam fora de escopo como alvos de migracao
+- o runtime `save_memory` continua usando a memoria legada (JSON) e nao foi migrado
+
+Veja `docs/MEMORY_MIGRATION_CLI.md` para a documentacao principal do CLI.
   4. system prompt (core/prompt.txt) como ultima parte/autoridade final
 
 ## 3. Migration Goals
@@ -244,4 +261,3 @@ Considerar a migracao segura somente quando:
 - Dual-write deve existir ou evitar para reduzir duplicacao?
 - Quando congelar/desativar JSON legado?
 - Deve haver uma UI/manual review para promover `candidate` -> `validated` antes de confiar?
-

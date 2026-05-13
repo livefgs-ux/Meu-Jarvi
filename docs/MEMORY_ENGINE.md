@@ -6,6 +6,7 @@ See also:
 - `docs/MEMORY_ARCHITECTURE.md`
 - `docs/MEMORY_SCHEMA.md`
 - `docs/READ_ONLY_MEMORY_ADAPTER_DESIGN.md`
+- `docs/MEMORY_MIGRATION_CLI.md` (offline legacy JSON migration tooling)
 
 ## Goals
 - Local, owned, auditable memory.
@@ -56,4 +57,3 @@ Default behavior:
 - Automatic runtime writes to SQLite.
 - Migration of legacy JSON memory into SQLite.
 - Embeddings/vector search.
-
