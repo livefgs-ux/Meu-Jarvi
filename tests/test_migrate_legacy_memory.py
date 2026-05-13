@@ -8,8 +8,11 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
+from memory_engine.retriever import search_memories
+
 from tools.migrate_legacy_memory import (
     apply_privacy_check,
+    apply_report,
     build_dry_run_report,
     iter_legacy_items,
     load_legacy_memory,
@@ -110,15 +113,15 @@ class TestMigrateLegacyMemoryDryRun(unittest.TestCase):
             self.assertFalse((td_path / "data" / "jarvis_memory.db").exists())
             self.assertFalse((td_path / "data" / "raw_events.jsonl").exists())
 
-            # The tool itself must not import writer or call create_memory.
+            # Phase 2A allows create_memory, but still forbids direct sqlite/manual DB access
+            # and non-create writer operations.
             src = (Path(__file__).resolve().parents[1] / "tools" / "migrate_legacy_memory.py").read_text(encoding="utf-8")
-            self.assertNotIn("create_memory", src)
             self.assertNotIn("update_memory_status", src)
             self.assertNotIn("archive_memory", src)
             self.assertNotIn("import sqlite3", src)
-            self.assertNotIn("memory_engine.writer", src)
             self.assertNotIn("open_db", src)
             self.assertNotIn("init_db", src)
+            self.assertNotIn("append_event", src)
             self.assertNotIn("append_event", src)
 
     def test_cli_dry_run_success(self):
@@ -132,16 +135,27 @@ class TestMigrateLegacyMemoryDryRun(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertEqual(buf_err.getvalue(), "")
 
-    def test_cli_apply_is_rejected(self):
+    def test_apply_requires_db_path(self):
         with tempfile.TemporaryDirectory() as td:
             legacy_path = Path(td) / "legacy.json"
             self._write_json(legacy_path, {"preferences": {"favorite_language": {"value": "Portuguese"}}})
             buf_out = io.StringIO()
             buf_err = io.StringIO()
             with redirect_stdout(buf_out), redirect_stderr(buf_err):
-                code = main(["--legacy-path", str(legacy_path), "--apply"])
+                code = main(["--legacy-path", str(legacy_path), "--apply", "--event-log-path", str(Path(td) / "events.jsonl")])
             self.assertEqual(code, 2)
-            self.assertIn("not implemented", buf_err.getvalue().lower())
+            self.assertIn("db-path", buf_err.getvalue().lower())
+
+    def test_apply_requires_event_log_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            legacy_path = Path(td) / "legacy.json"
+            self._write_json(legacy_path, {"preferences": {"favorite_language": {"value": "Portuguese"}}})
+            buf_out = io.StringIO()
+            buf_err = io.StringIO()
+            with redirect_stdout(buf_out), redirect_stderr(buf_err):
+                code = main(["--legacy-path", str(legacy_path), "--apply", "--db-path", str(Path(td) / "mem.db")])
+            self.assertEqual(code, 2)
+            self.assertIn("event-log-path", buf_err.getvalue().lower())
 
     def test_unknown_category_becomes_review_candidate(self):
         it = iter_legacy_items({"unknown": {"x": {"value": "Y"}}})[0]
@@ -155,15 +169,15 @@ class TestMigrateLegacyMemoryDryRun(unittest.TestCase):
         items = iter_legacy_items({"preferences": {"empty": {"value": ""}, "blank": ""}})
         self.assertEqual(items, [])
 
-    def test_module_imports_do_not_include_writer(self):
+    def test_no_forbidden_imports_after_apply_mode(self):
         src_path = Path(__file__).resolve().parents[1] / "tools" / "migrate_legacy_memory.py"
         tree = ast.parse(src_path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom):
-                self.assertNotEqual(node.module, "memory_engine.writer")
+                self.assertNotIn(node.module or "", {"sqlite3"})
             if isinstance(node, ast.Import):
                 for alias in node.names:
-                    self.assertNotEqual(alias.name, "memory_engine.writer")
+                    self.assertNotEqual(alias.name, "sqlite3")
 
     def test_text_report_does_not_include_candidate_content_by_default(self):
         with tempfile.TemporaryDirectory() as td:
@@ -326,15 +340,218 @@ class TestMigrateLegacyMemoryDryRun(unittest.TestCase):
             _ = build_dry_run_report(missing, project="meu-jarvis", allow_missing=True)
             self.assertFalse(missing.exists())
 
-    def test_apply_with_allow_missing_still_rejected(self):
+    def test_apply_rejects_real_default_db_path(self):
         with tempfile.TemporaryDirectory() as td:
-            missing = str(Path(td) / "missing.json")
+            legacy_path = Path(td) / "legacy.json"
+            self._write_json(legacy_path, {"preferences": {"favorite_language": {"value": "Portuguese"}}})
             buf_out = io.StringIO()
             buf_err = io.StringIO()
             with redirect_stdout(buf_out), redirect_stderr(buf_err):
-                code = main(["--legacy-path", missing, "--allow-missing", "--apply"])
+                code = main(
+                    [
+                        "--legacy-path",
+                        str(legacy_path),
+                        "--apply",
+                        "--db-path",
+                        "data/jarvis_memory.db",
+                        "--event-log-path",
+                        str(Path(td) / "events.jsonl"),
+                    ]
+                )
             self.assertEqual(code, 2)
-            self.assertIn("apply", buf_err.getvalue().lower())
+
+    def test_apply_rejects_real_default_event_log_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            legacy_path = Path(td) / "legacy.json"
+            self._write_json(legacy_path, {"preferences": {"favorite_language": {"value": "Portuguese"}}})
+            buf_out = io.StringIO()
+            buf_err = io.StringIO()
+            with redirect_stdout(buf_out), redirect_stderr(buf_err):
+                code = main(
+                    [
+                        "--legacy-path",
+                        str(legacy_path),
+                        "--apply",
+                        "--db-path",
+                        str(Path(td) / "mem.db"),
+                        "--event-log-path",
+                        "data/raw_events.jsonl",
+                    ]
+                )
+            self.assertEqual(code, 2)
+
+    def test_apply_writes_to_temp_sqlite_only_and_retriever_can_read(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            legacy_path = td_path / "legacy.json"
+            self._write_json(legacy_path, {"preferences": {"favorite_language": {"value": "Portuguese"}}})
+            db_path = td_path / "mem.db"
+            log_path = td_path / "events.jsonl"
+
+            report = build_dry_run_report(legacy_path, project="meu-jarvis")
+            applied = apply_report(report, db_path=db_path, event_log_path=log_path, include_review=False)
+            self.assertGreaterEqual(applied.applied_items, 1)
+            self.assertTrue(db_path.exists())
+            self.assertTrue(log_path.exists())
+
+            rows = search_memories(db_path=db_path, limit=20)
+            self.assertTrue(rows)
+
+    def test_apply_skips_blocked_candidates(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            legacy_path = td_path / "legacy.json"
+            token = "sk-THIS_IS_NOT_REAL_BUT_SHOULD_BLOCK_1234567890"
+            self._write_json(legacy_path, {"notes": {"api_key": {"value": token}}})
+            db_path = td_path / "mem.db"
+            log_path = td_path / "events.jsonl"
+
+            report = build_dry_run_report(legacy_path, project="meu-jarvis")
+            applied = apply_report(report, db_path=db_path, event_log_path=log_path, include_review=True)
+            self.assertEqual(applied.applied_items, 0)
+            self.assertGreaterEqual(applied.skipped_items, 1)
+
+    def test_apply_skips_duplicates(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            legacy_path = td_path / "legacy.json"
+            self._write_json(
+                legacy_path,
+                {"preferences": [{"key": "favorite_language", "value": "Portuguese"}, {"key": "favorite_language", "value": "Portuguese"}]},
+            )
+            db_path = td_path / "mem.db"
+            log_path = td_path / "events.jsonl"
+
+            report = build_dry_run_report(legacy_path, project="meu-jarvis")
+            applied = apply_report(report, db_path=db_path, event_log_path=log_path, include_review=False)
+            self.assertEqual(applied.applied_items, 1)
+            self.assertGreaterEqual(applied.skipped_items, 1)
+
+    def test_apply_skips_review_required_by_default(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            legacy_path = td_path / "legacy.json"
+            self._write_json(legacy_path, {"identity": {"name": {"value": "Fabricio"}}})
+            db_path = td_path / "mem.db"
+            log_path = td_path / "events.jsonl"
+
+            report = build_dry_run_report(legacy_path, project="meu-jarvis")
+            applied = apply_report(report, db_path=db_path, event_log_path=log_path, include_review=False)
+            self.assertEqual(applied.applied_items, 0)
+            self.assertGreaterEqual(applied.skipped_items, 1)
+            self.assertTrue(any(c.skip_reason == "requires_review" for c in applied.candidates))
+
+    def test_apply_include_review_applies_review_candidates(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            legacy_path = td_path / "legacy.json"
+            self._write_json(legacy_path, {"identity": {"name": {"value": "Fabricio"}}})
+            db_path = td_path / "mem.db"
+            log_path = td_path / "events.jsonl"
+
+            report = build_dry_run_report(legacy_path, project="meu-jarvis")
+            applied = apply_report(report, db_path=db_path, event_log_path=log_path, include_review=True)
+            self.assertEqual(applied.applied_items, 1)
+
+    def test_apply_allow_missing_does_not_create_db_or_log(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            missing_legacy = td_path / "missing.json"
+            db_path = td_path / "mem.db"
+            log_path = td_path / "events.jsonl"
+            buf_out = io.StringIO()
+            buf_err = io.StringIO()
+            with redirect_stdout(buf_out), redirect_stderr(buf_err):
+                code = main(
+                    [
+                        "--legacy-path",
+                        str(missing_legacy),
+                        "--allow-missing",
+                        "--apply",
+                        "--db-path",
+                        str(db_path),
+                        "--event-log-path",
+                        str(log_path),
+                    ]
+                )
+            self.assertEqual(code, 0)
+            self.assertFalse(db_path.exists())
+            self.assertFalse(log_path.exists())
+
+    def test_apply_never_creates_legacy_long_term(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        legacy_long_term = repo_root / "memory" / "long_term.json"
+        self.assertFalse(legacy_long_term.exists())
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            legacy_path = td_path / "legacy.json"
+            self._write_json(legacy_path, {"preferences": {"favorite_language": {"value": "Portuguese"}}})
+            db_path = td_path / "mem.db"
+            log_path = td_path / "events.jsonl"
+            report = build_dry_run_report(legacy_path, project="meu-jarvis")
+            _ = apply_report(report, db_path=db_path, event_log_path=log_path, include_review=False)
+        self.assertFalse(legacy_long_term.exists())
+
+    def test_json_apply_report_omits_content_by_default(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            legacy_path = td_path / "legacy.json"
+            self._write_json(legacy_path, {"preferences": {"favorite_language": {"value": "Portuguese"}}})
+            db_path = td_path / "mem.db"
+            log_path = td_path / "events.jsonl"
+            buf_out = io.StringIO()
+            buf_err = io.StringIO()
+            with redirect_stdout(buf_out), redirect_stderr(buf_err):
+                code = main(
+                    [
+                        "--legacy-path",
+                        str(legacy_path),
+                        "--apply",
+                        "--db-path",
+                        str(db_path),
+                        "--event-log-path",
+                        str(log_path),
+                        "--json",
+                    ]
+                )
+            self.assertEqual(code, 0)
+            self.assertNotIn("\"content\"", buf_out.getvalue())
+
+    def test_json_apply_include_content_still_hides_blocked(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            legacy_path = td_path / "legacy.json"
+            token = "sk-THIS_IS_NOT_REAL_BUT_SHOULD_BLOCK_1234567890"
+            self._write_json(
+                legacy_path,
+                {
+                    "preferences": {"favorite_language": {"value": "Portuguese"}},
+                    "notes": {"api_key": {"value": token}},
+                },
+            )
+            db_path = td_path / "mem.db"
+            log_path = td_path / "events.jsonl"
+            buf_out = io.StringIO()
+            buf_err = io.StringIO()
+            with redirect_stdout(buf_out), redirect_stderr(buf_err):
+                code = main(
+                    [
+                        "--legacy-path",
+                        str(legacy_path),
+                        "--apply",
+                        "--include-review",
+                        "--db-path",
+                        str(db_path),
+                        "--event-log-path",
+                        str(log_path),
+                        "--json",
+                        "--include-content",
+                    ]
+                )
+            self.assertEqual(code, 0)
+            out = buf_out.getvalue()
+            self.assertIn("Portuguese", out)
+            self.assertNotIn(token, out)
 
     def test_direct_script_execution_allow_missing(self):
         repo_root = Path(__file__).resolve().parents[1]
