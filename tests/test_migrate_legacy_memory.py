@@ -160,9 +160,19 @@ class TestMigrateLegacyMemoryDryRun(unittest.TestCase):
             buf_out = io.StringIO()
             buf_err = io.StringIO()
             with redirect_stdout(buf_out), redirect_stderr(buf_err):
-                code = main(["--legacy-path", str(legacy_path), "--apply", "--event-log-path", str(Path(td) / "events.jsonl")])
+                code = main(
+                    [
+                        "--legacy-path",
+                        str(legacy_path),
+                        "--apply",
+                        "--confirm-apply",
+                        "--event-log-path",
+                        str(Path(td) / "events.jsonl"),
+                    ]
+                )
             self.assertEqual(code, 2)
             self.assertIn("db-path", buf_err.getvalue().lower())
+            self.assertIn("refusing to write", buf_err.getvalue().lower())
 
     def test_apply_requires_event_log_path(self):
         with tempfile.TemporaryDirectory() as td:
@@ -171,9 +181,67 @@ class TestMigrateLegacyMemoryDryRun(unittest.TestCase):
             buf_out = io.StringIO()
             buf_err = io.StringIO()
             with redirect_stdout(buf_out), redirect_stderr(buf_err):
-                code = main(["--legacy-path", str(legacy_path), "--apply", "--db-path", str(Path(td) / "mem.db")])
+                code = main(
+                    [
+                        "--legacy-path",
+                        str(legacy_path),
+                        "--apply",
+                        "--confirm-apply",
+                        "--db-path",
+                        str(Path(td) / "mem.db"),
+                    ]
+                )
             self.assertEqual(code, 2)
             self.assertIn("event-log-path", buf_err.getvalue().lower())
+            self.assertIn("refusing to write", buf_err.getvalue().lower())
+
+    def test_apply_requires_confirm_apply(self):
+        with tempfile.TemporaryDirectory() as td:
+            legacy_path = Path(td) / "legacy.json"
+            self._write_json(legacy_path, {"preferences": {"favorite_language": {"value": "Portuguese"}}})
+            db_path = Path(td) / "mem.db"
+            log_path = Path(td) / "events.jsonl"
+            buf_out = io.StringIO()
+            buf_err = io.StringIO()
+            with redirect_stdout(buf_out), redirect_stderr(buf_err):
+                code = main(
+                    [
+                        "--legacy-path",
+                        str(legacy_path),
+                        "--apply",
+                        "--db-path",
+                        str(db_path),
+                        "--event-log-path",
+                        str(log_path),
+                    ]
+                )
+            self.assertEqual(code, 2)
+            self.assertIn("confirm-apply", buf_err.getvalue().lower())
+            self.assertFalse(db_path.exists())
+            self.assertFalse(log_path.exists())
+
+    def test_apply_same_db_and_log_path_message_clear(self):
+        with tempfile.TemporaryDirectory() as td:
+            legacy_path = Path(td) / "legacy.json"
+            self._write_json(legacy_path, {"preferences": {"favorite_language": {"value": "Portuguese"}}})
+            same = str(Path(td) / "same.path")
+            buf_out = io.StringIO()
+            buf_err = io.StringIO()
+            with redirect_stdout(buf_out), redirect_stderr(buf_err):
+                code = main(
+                    [
+                        "--legacy-path",
+                        str(legacy_path),
+                        "--apply",
+                        "--confirm-apply",
+                        "--db-path",
+                        same,
+                        "--event-log-path",
+                        same,
+                    ]
+                )
+            self.assertEqual(code, 2)
+            self.assertIn("must be different files", buf_err.getvalue().lower())
 
     def test_unknown_category_becomes_review_candidate(self):
         it = iter_legacy_items({"unknown": {"x": {"value": "Y"}}})[0]
@@ -284,6 +352,7 @@ class TestMigrateLegacyMemoryDryRun(unittest.TestCase):
                         "--legacy-path",
                         str(legacy_path),
                         "--apply",
+                        "--confirm-apply",
                         "--db-path",
                         str(db_path),
                         "--event-log-path",
@@ -295,6 +364,11 @@ class TestMigrateLegacyMemoryDryRun(unittest.TestCase):
             data = json.loads(buf_out.getvalue())
             self.assertIn("applied_items", data)
             self.assertIn("skipped_items", data)
+            self.assertTrue(data.get("apply_requested"))
+            self.assertTrue(data.get("apply_confirmed"))
+            self.assertTrue(data.get("apply_target_db"))
+            self.assertTrue(data.get("apply_event_log"))
+            self.assertNotIn("content", buf_out.getvalue())
 
     def test_json_report_includes_breakdowns(self):
         with tempfile.TemporaryDirectory() as td:
@@ -451,6 +525,7 @@ class TestMigrateLegacyMemoryDryRun(unittest.TestCase):
                         "--legacy-path",
                         str(legacy_path),
                         "--apply",
+                        "--confirm-apply",
                         "--db-path",
                         "data/jarvis_memory.db",
                         "--event-log-path",
@@ -458,6 +533,8 @@ class TestMigrateLegacyMemoryDryRun(unittest.TestCase):
                     ]
                 )
             self.assertEqual(code, 2)
+            self.assertIn("refusing to write", buf_err.getvalue().lower())
+            self.assertIn("data/jarvis_memory.db", buf_err.getvalue().lower())
 
     def test_apply_rejects_real_default_event_log_path(self):
         with tempfile.TemporaryDirectory() as td:
@@ -471,6 +548,7 @@ class TestMigrateLegacyMemoryDryRun(unittest.TestCase):
                         "--legacy-path",
                         str(legacy_path),
                         "--apply",
+                        "--confirm-apply",
                         "--db-path",
                         str(Path(td) / "mem.db"),
                         "--event-log-path",
@@ -478,6 +556,8 @@ class TestMigrateLegacyMemoryDryRun(unittest.TestCase):
                     ]
                 )
             self.assertEqual(code, 2)
+            self.assertIn("refusing to write", buf_err.getvalue().lower())
+            self.assertIn("data/raw_events.jsonl", buf_err.getvalue().lower())
 
     def test_apply_writes_to_temp_sqlite_only_and_retriever_can_read(self):
         with tempfile.TemporaryDirectory() as td:
@@ -495,6 +575,34 @@ class TestMigrateLegacyMemoryDryRun(unittest.TestCase):
 
             rows = search_memories(db_path=db_path, limit=20)
             self.assertTrue(rows)
+
+    def test_apply_text_report_includes_apply_target_metadata_without_content(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            legacy_path = td_path / "legacy.json"
+            self._write_json(legacy_path, {"preferences": {"favorite_language": {"value": "Portuguese"}}})
+            db_path = td_path / "mem.db"
+            log_path = td_path / "events.jsonl"
+            buf_out = io.StringIO()
+            buf_err = io.StringIO()
+            with redirect_stdout(buf_out), redirect_stderr(buf_err):
+                code = main(
+                    [
+                        "--legacy-path",
+                        str(legacy_path),
+                        "--apply",
+                        "--confirm-apply",
+                        "--db-path",
+                        str(db_path),
+                        "--event-log-path",
+                        str(log_path),
+                    ]
+                )
+            self.assertEqual(code, 0)
+            out = buf_out.getvalue()
+            self.assertIn("Apply target DB", out)
+            self.assertIn("Apply event log", out)
+            self.assertNotIn("Portuguese", out)
 
     def test_apply_skips_blocked_candidates(self):
         with tempfile.TemporaryDirectory() as td:
@@ -567,6 +675,7 @@ class TestMigrateLegacyMemoryDryRun(unittest.TestCase):
                         str(missing_legacy),
                         "--allow-missing",
                         "--apply",
+                        "--confirm-apply",
                         "--db-path",
                         str(db_path),
                         "--event-log-path",
@@ -574,6 +683,33 @@ class TestMigrateLegacyMemoryDryRun(unittest.TestCase):
                     ]
                 )
             self.assertEqual(code, 0)
+            self.assertFalse(db_path.exists())
+            self.assertFalse(log_path.exists())
+            self.assertIn("nothing to migrate", buf_out.getvalue().lower())
+
+    def test_apply_allow_missing_still_requires_confirm_apply(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            missing_legacy = td_path / "missing.json"
+            db_path = td_path / "mem.db"
+            log_path = td_path / "events.jsonl"
+            buf_out = io.StringIO()
+            buf_err = io.StringIO()
+            with redirect_stdout(buf_out), redirect_stderr(buf_err):
+                code = main(
+                    [
+                        "--legacy-path",
+                        str(missing_legacy),
+                        "--allow-missing",
+                        "--apply",
+                        "--db-path",
+                        str(db_path),
+                        "--event-log-path",
+                        str(log_path),
+                    ]
+                )
+            self.assertEqual(code, 2)
+            self.assertIn("confirm-apply", buf_err.getvalue().lower())
             self.assertFalse(db_path.exists())
             self.assertFalse(log_path.exists())
 
@@ -606,6 +742,7 @@ class TestMigrateLegacyMemoryDryRun(unittest.TestCase):
                         "--legacy-path",
                         str(legacy_path),
                         "--apply",
+                        "--confirm-apply",
                         "--db-path",
                         str(db_path),
                         "--event-log-path",
@@ -638,6 +775,7 @@ class TestMigrateLegacyMemoryDryRun(unittest.TestCase):
                         "--legacy-path",
                         str(legacy_path),
                         "--apply",
+                        "--confirm-apply",
                         "--include-review",
                         "--db-path",
                         str(db_path),

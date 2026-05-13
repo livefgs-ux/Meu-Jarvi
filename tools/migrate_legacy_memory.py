@@ -80,6 +80,10 @@ class MigrationReport:
     warning: str = ""
     applied_items: int = 0
     skipped_items: int = 0
+    apply_requested: bool = False
+    apply_confirmed: bool = False
+    apply_target_db: str = ""
+    apply_event_log: str = ""
 
 
 def empty_missing_report(path: str | Path) -> MigrationReport:
@@ -99,14 +103,22 @@ def empty_missing_report(path: str | Path) -> MigrationReport:
         warning=f"Legacy memory file not found. Nothing to migrate: {str(p)}",
         applied_items=0,
         skipped_items=0,
+        apply_requested=False,
+        apply_confirmed=False,
+        apply_target_db="",
+        apply_event_log="",
     )
 
 
 def validate_apply_paths(db_path: str | Path, event_log_path: str | Path) -> tuple[Path, Path]:
     if not db_path:
-        raise ValueError("Missing required --db-path for --apply")
+        raise ValueError(
+            "--apply requires --db-path. Refusing to write without an explicit temporary/test database path."
+        )
     if not event_log_path:
-        raise ValueError("Missing required --event-log-path for --apply")
+        raise ValueError(
+            "--apply requires --event-log-path. Refusing to write without an explicit temporary/test event log path."
+        )
 
     repo_root = Path(__file__).resolve().parent.parent
     real_db = (repo_root / "data" / "jarvis_memory.db").resolve(strict=False)
@@ -116,11 +128,17 @@ def validate_apply_paths(db_path: str | Path, event_log_path: str | Path) -> tup
     log_abs = Path(event_log_path).expanduser().resolve(strict=False)
 
     if db_abs == log_abs:
-        raise ValueError("--db-path and --event-log-path must be different files")
+        raise ValueError("--db-path and --event-log-path must be different files.")
     if db_abs == real_db:
-        raise ValueError("Refusing to write to real runtime DB path: data/jarvis_memory.db")
+        raise ValueError(
+            "Refusing to write to the real Jarvis memory database in Phase 2C: data/jarvis_memory.db. "
+            "Use an explicit temporary/test DB path."
+        )
     if log_abs == real_log:
-        raise ValueError("Refusing to write to real runtime event log path: data/raw_events.jsonl")
+        raise ValueError(
+            "Refusing to write to the real Jarvis event log in Phase 2C: data/raw_events.jsonl. "
+            "Use an explicit temporary/test event log path."
+        )
 
     return db_abs, log_abs
 
@@ -134,7 +152,13 @@ def apply_report(
 ) -> MigrationReport:
     # Never write anything when legacy source is missing in allow-missing mode.
     if report.missing_source:
-        return replace(report, applied_items=0, skipped_items=0)
+        return replace(
+            report,
+            applied_items=0,
+            skipped_items=0,
+            apply_requested=True,
+            apply_confirmed=True,
+        )
 
     db_abs, log_abs = validate_apply_paths(db_path, event_log_path)
 
@@ -180,7 +204,16 @@ def apply_report(
         applied += 1
         updated_candidates.append(replace(c, applied=True))
 
-    return replace(report, candidates=updated_candidates, applied_items=applied, skipped_items=skipped)
+    return replace(
+        report,
+        candidates=updated_candidates,
+        applied_items=applied,
+        skipped_items=skipped,
+        apply_requested=True,
+        apply_confirmed=True,
+        apply_target_db=str(db_abs),
+        apply_event_log=str(log_abs),
+    )
 
 
 def load_legacy_memory(path: str | Path) -> dict[str, Any]:
@@ -444,6 +477,15 @@ def format_report(report: MigrationReport) -> str:
         lines.append("Missing Source")
         lines.append(f"- {report.warning}")
 
+    if report.apply_requested:
+        lines.append("")
+        lines.append("Apply Preview (safe)")
+        if report.apply_target_db:
+            lines.append(f"- Apply target DB: {report.apply_target_db}")
+        if report.apply_event_log:
+            lines.append(f"- Apply event log: {report.apply_event_log}")
+        lines.append("- Candidate content omitted by default.")
+
     # Summary
     lines.append("")
     lines.append("Summary")
@@ -530,6 +572,10 @@ def _report_to_safe_json(report: MigrationReport, *, include_content: bool) -> d
         "duplicate_items": report.duplicate_items,
         "applied_items": report.applied_items,
         "skipped_items": report.skipped_items,
+        "apply_requested": bool(report.apply_requested),
+        "apply_confirmed": bool(report.apply_confirmed),
+        "apply_target_db": report.apply_target_db or "",
+        "apply_event_log": report.apply_event_log or "",
         # Keep explicit "breakdown_*" keys; also keep legacy "by_*" for compatibility.
         "breakdown_by_source_category": dict(report.by_source_category),
         "breakdown_by_memory_type": dict(report.by_memory_type),
@@ -578,6 +624,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--db-path", help="SQLite DB path for --apply (must be explicit; real runtime DB is rejected)")
     parser.add_argument("--event-log-path", help="JSONL event log path for --apply (must be explicit; real runtime log is rejected)")
     parser.add_argument("--include-review", action="store_true", help="Include requires_review candidates in --apply (still skips blocked/duplicates)")
+    parser.add_argument("--confirm-apply", action="store_true", help="Required with --apply to prevent accidental writes")
 
     try:
         args = parser.parse_args(argv)
@@ -585,11 +632,23 @@ def main(argv: list[str] | None = None) -> int:
         # argparse uses SystemExit for -h and usage errors.
         return int(e.code) if isinstance(e.code, int) else 2
 
+    if args.apply and (not args.confirm_apply):
+        print(
+            "ERROR: --apply requires --confirm-apply in this phase. This prevents accidental writes.",
+            file=sys.stderr,
+        )
+        return 2
     if args.apply and (not args.db_path):
-        print("ERROR: --apply requires --db-path", file=sys.stderr)
+        print(
+            "ERROR: --apply requires --db-path. Refusing to write without an explicit temporary/test database path.",
+            file=sys.stderr,
+        )
         return 2
     if args.apply and (not args.event_log_path):
-        print("ERROR: --apply requires --event-log-path", file=sys.stderr)
+        print(
+            "ERROR: --apply requires --event-log-path. Refusing to write without an explicit temporary/test event log path.",
+            file=sys.stderr,
+        )
         return 2
 
     try:
@@ -607,22 +666,28 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.apply:
-        # If legacy source is missing and allow-missing was used, do not create DB/log.
-        if not report.missing_source:
-            try:
-                report = apply_report(
-                    report,
-                    db_path=args.db_path,
-                    event_log_path=args.event_log_path,
-                    include_review=bool(args.include_review),
-                )
-            except ValueError as e:
-                print(f"ERROR: {e}", file=sys.stderr)
-                return 2
-            except Exception as e:
-                print("ERROR: failed to apply migration report", file=sys.stderr)
-                _ = e
-                return 1
+        try:
+            report = apply_report(
+                report,
+                db_path=args.db_path,
+                event_log_path=args.event_log_path,
+                include_review=bool(args.include_review),
+            )
+            # Attach safe apply metadata for output (even if missing_source=True).
+            report = replace(
+                report,
+                apply_requested=True,
+                apply_confirmed=True,
+                apply_target_db=str(Path(args.db_path).expanduser().resolve(strict=False)),
+                apply_event_log=str(Path(args.event_log_path).expanduser().resolve(strict=False)),
+            )
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
+        except Exception as e:
+            print("ERROR: failed to apply migration report", file=sys.stderr)
+            _ = e
+            return 1
 
     if args.json:
         print(json.dumps(_report_to_safe_json(report, include_content=bool(args.include_content)), indent=2, ensure_ascii=False, sort_keys=True))
