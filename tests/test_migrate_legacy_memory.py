@@ -253,6 +253,87 @@ class TestMigrateLegacyMemoryDryRun(unittest.TestCase):
             self.assertIn("PREFERENCE", report.by_memory_type)
             self.assertIn("global", report.by_scope)
 
+    def test_missing_file_without_allow_missing_still_fails(self):
+        with tempfile.TemporaryDirectory() as td:
+            missing = Path(td) / "missing.json"
+            with self.assertRaises(FileNotFoundError):
+                build_dry_run_report(missing, project="meu-jarvis", allow_missing=False)
+
+    def test_missing_file_with_allow_missing_returns_empty_report(self):
+        with tempfile.TemporaryDirectory() as td:
+            missing = Path(td) / "missing.json"
+            report = build_dry_run_report(missing, project="meu-jarvis", allow_missing=True)
+            self.assertTrue(report.missing_source)
+            self.assertEqual(report.total_items, 0)
+            self.assertEqual(report.migratable_items, 0)
+            self.assertEqual(report.blocked_items, 0)
+            self.assertEqual(report.review_required_items, 0)
+            self.assertEqual(report.duplicate_items, 0)
+            self.assertEqual(report.candidates, [])
+            self.assertTrue(report.warning)
+
+    def test_cli_missing_file_without_allow_missing_returns_2(self):
+        with tempfile.TemporaryDirectory() as td:
+            missing = str(Path(td) / "missing.json")
+            buf_out = io.StringIO()
+            buf_err = io.StringIO()
+            with redirect_stdout(buf_out), redirect_stderr(buf_err):
+                code = main(["--legacy-path", missing])
+            self.assertEqual(code, 2)
+            self.assertIn("not found", buf_err.getvalue().lower())
+
+    def test_cli_missing_file_with_allow_missing_returns_0(self):
+        with tempfile.TemporaryDirectory() as td:
+            missing = str(Path(td) / "missing.json")
+            buf_out = io.StringIO()
+            buf_err = io.StringIO()
+            with redirect_stdout(buf_out), redirect_stderr(buf_err):
+                code = main(["--legacy-path", missing, "--allow-missing"])
+            self.assertEqual(code, 0)
+            self.assertEqual(buf_err.getvalue(), "")
+
+    def test_missing_file_text_report_is_safe(self):
+        with tempfile.TemporaryDirectory() as td:
+            missing = Path(td) / "missing.json"
+            report = build_dry_run_report(missing, project="meu-jarvis", allow_missing=True)
+            txt = format_report(report)
+            self.assertIn("nothing to migrate", txt.lower())
+            self.assertNotIn("content", txt.lower())
+
+    def test_missing_file_json_report_is_safe(self):
+        with tempfile.TemporaryDirectory() as td:
+            missing = str(Path(td) / "missing.json")
+            buf_out = io.StringIO()
+            buf_err = io.StringIO()
+            with redirect_stdout(buf_out), redirect_stderr(buf_err):
+                code = main(["--legacy-path", missing, "--allow-missing", "--json"])
+            self.assertEqual(code, 0)
+            self.assertEqual(buf_err.getvalue(), "")
+            data = json.loads(buf_out.getvalue())
+            self.assertTrue(data.get("missing_source"))
+            self.assertTrue(data.get("warning"))
+            self.assertEqual(data.get("total_items"), 0)
+            self.assertEqual(data.get("candidates"), [])
+            # Safe-by-default: should not include any content field.
+            self.assertNotIn("content", buf_out.getvalue())
+
+    def test_allow_missing_does_not_create_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            missing = Path(td) / "missing.json"
+            self.assertFalse(missing.exists())
+            _ = build_dry_run_report(missing, project="meu-jarvis", allow_missing=True)
+            self.assertFalse(missing.exists())
+
+    def test_apply_with_allow_missing_still_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            missing = str(Path(td) / "missing.json")
+            buf_out = io.StringIO()
+            buf_err = io.StringIO()
+            with redirect_stdout(buf_out), redirect_stderr(buf_err):
+                code = main(["--legacy-path", missing, "--allow-missing", "--apply"])
+            self.assertEqual(code, 2)
+            self.assertIn("apply", buf_err.getvalue().lower())
+
 
 if __name__ == "__main__":
     unittest.main()

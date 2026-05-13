@@ -64,6 +64,26 @@ class MigrationReport:
     by_scope: dict[str, int]
     unknown_categories: list[str]
     candidates: list[MigrationCandidate]
+    missing_source: bool = False
+    warning: str = ""
+
+
+def empty_missing_report(path: str | Path) -> MigrationReport:
+    p = Path(path)
+    return MigrationReport(
+        total_items=0,
+        migratable_items=0,
+        blocked_items=0,
+        review_required_items=0,
+        duplicate_items=0,
+        by_source_category={},
+        by_memory_type={},
+        by_scope={},
+        unknown_categories=[],
+        candidates=[],
+        missing_source=True,
+        warning=f"Legacy memory file not found. Nothing to migrate: {str(p)}",
+    )
 
 
 def load_legacy_memory(path: str | Path) -> dict[str, Any]:
@@ -262,8 +282,20 @@ def _apply_dedupe(candidates: list[MigrationCandidate]) -> list[MigrationCandida
     return out
 
 
-def build_dry_run_report(path: str | Path, project: str = "meu-jarvis") -> MigrationReport:
-    legacy = load_legacy_memory(path)
+def build_dry_run_report(
+    path: str | Path,
+    project: str = "meu-jarvis",
+    *,
+    allow_missing: bool = False,
+) -> MigrationReport:
+    p = Path(path)
+    if not p.exists():
+        if allow_missing:
+            return empty_missing_report(p)
+        # Preserve strict behavior by default to avoid hiding wrong paths.
+        raise FileNotFoundError(f"Legacy memory file not found: {str(p)}")
+
+    legacy = load_legacy_memory(p)
     legacy_items = iter_legacy_items(legacy)
     candidates: list[MigrationCandidate] = []
 
@@ -308,6 +340,8 @@ def build_dry_run_report(path: str | Path, project: str = "meu-jarvis") -> Migra
 def format_report(report: MigrationReport) -> str:
     lines: list[str] = []
     lines.append("Legacy Memory Migration Dry-Run Report")
+    if report.missing_source and report.warning:
+        lines.append(f"WARNING: {report.warning}")
     lines.append(f"Total items: {report.total_items}")
     lines.append(f"Migratable: {report.migratable_items}")
     lines.append(f"Blocked (privacy): {report.blocked_items}")
@@ -364,6 +398,8 @@ def format_report(report: MigrationReport) -> str:
 def _report_to_safe_json(report: MigrationReport, *, include_content: bool) -> dict[str, Any]:
     # Safe JSON output: content omitted by default; never include blocked content.
     out = {
+        "missing_source": bool(report.missing_source),
+        "warning": report.warning or "",
         "total_items": report.total_items,
         "migratable_items": report.migratable_items,
         "blocked_items": report.blocked_items,
@@ -405,6 +441,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true", default=True, help="Dry-run only (default)")
     parser.add_argument("--json", action="store_true", help="Print JSON report (safe output)")
     parser.add_argument("--include-content", action="store_true", help="Include content in JSON for non-blocked items only")
+    parser.add_argument("--allow-missing", action="store_true", help="If legacy file is missing, return an empty report (exit 0)")
     parser.add_argument("--apply", action="store_true", help="NOT IMPLEMENTED in Phase 1A (dry-run only)")
 
     try:
@@ -418,7 +455,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        report = build_dry_run_report(args.legacy_path, project=args.project)
+        report = build_dry_run_report(args.legacy_path, project=args.project, allow_missing=bool(args.allow_missing))
     except FileNotFoundError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
