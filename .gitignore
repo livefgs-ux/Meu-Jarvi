@@ -8,3 +8,5 @@ __pycache__/
 inicialmente.txt
 .venv/
 config/api_keys.json
+
+.local_test/
