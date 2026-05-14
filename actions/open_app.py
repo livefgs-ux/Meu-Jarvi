@@ -3,6 +3,7 @@ import time
 import subprocess
 import platform
 import shutil
+from core.environment_state import get_active_window_info, verify_app_match
 
 try:
     import psutil
@@ -299,10 +300,25 @@ def open_app(
 
     try:
         if launcher(normalized):
+            # Best-effort verification
+            time.sleep(0.5)
+            win = get_active_window_info()
+            if win.get("status") == "ok":
+                observed_title = win.get("title", "")
+                observed_proc = win.get("process_name", "")
+                observed = f"{observed_title} {observed_proc}".strip()
+                check = verify_app_match(app_name, observed)
+                if not check["match"]:
+                    reason = check.get("reason", "mismatch")
+                    print(f"[open_app] Verification failed: {reason}")
+                    return f"Opened something, but it might not be {app_name}. (Detected: {observed})"
+
             return f"Opened {app_name}."
+
         if normalized.lower() != app_name.lower():
             if launcher(app_name):
                 return f"Opened {app_name}."
+
         return (
             f"Could not confirm that {app_name} launched. "
             f"It may still be loading, or it might not be installed."

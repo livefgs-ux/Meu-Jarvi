@@ -3,6 +3,7 @@ import shutil
 import platform
 from pathlib import Path
 from datetime import datetime
+from core.environment_state import get_known_folders
 
 try:
     import send2trash
@@ -28,6 +29,9 @@ def _is_safe_path(target: Path) -> bool:
         return False
 
 def _get_desktop() -> Path:
+    known = get_known_folders()
+    if known.get("desktop"):
+        return Path(known["desktop"])
     if _OS == "Linux":
         xdg = os.environ.get("XDG_DESKTOP_DIR", "")
         if xdg and Path(xdg).exists():
@@ -35,6 +39,9 @@ def _get_desktop() -> Path:
     return Path.home() / "Desktop"
 
 def _get_downloads() -> Path:
+    known = get_known_folders()
+    if known.get("downloads"):
+        return Path(known["downloads"])
     if _OS == "Linux":
         xdg = os.environ.get("XDG_DOWNLOAD_DIR", "")
         if xdg and Path(xdg).exists():
@@ -42,6 +49,9 @@ def _get_downloads() -> Path:
     return Path.home() / "Downloads"
 
 def _get_documents() -> Path:
+    known = get_known_folders()
+    if known.get("documents"):
+        return Path(known["documents"])
     if _OS == "Linux":
         xdg = os.environ.get("XDG_DOCUMENTS_DIR", "")
         if xdg and Path(xdg).exists():
@@ -49,6 +59,9 @@ def _get_documents() -> Path:
     return Path.home() / "Documents"
 
 def _get_pictures() -> Path:
+    known = get_known_folders()
+    if known.get("pictures"):
+        return Path(known["pictures"])
     if _OS == "Linux":
         xdg = os.environ.get("XDG_PICTURES_DIR", "")
         if xdg and Path(xdg).exists():
@@ -56,6 +69,9 @@ def _get_pictures() -> Path:
     return Path.home() / "Pictures"
 
 def _get_music() -> Path:
+    known = get_known_folders()
+    if known.get("music"):
+        return Path(known["music"])
     if _OS == "Linux":
         xdg = os.environ.get("XDG_MUSIC_DIR", "")
         if xdg and Path(xdg).exists():
@@ -63,6 +79,9 @@ def _get_music() -> Path:
     return Path.home() / "Music"
 
 def _get_videos() -> Path:
+    known = get_known_folders()
+    if known.get("videos"):
+        return Path(known["videos"])
     if _OS == "Linux":
         xdg = os.environ.get("XDG_VIDEOS_DIR", "")
         if xdg and Path(xdg).exists():
