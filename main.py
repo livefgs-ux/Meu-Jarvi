@@ -267,6 +267,87 @@ def _apply_action_decision_gate(text: str) -> tuple[bool, str | None]:
 
     return True, None
 
+
+def _tool_call_gate_enabled() -> bool:
+    raw = os.environ.get("JARVIS_TOOL_CALL_GATE")
+    if raw is None:
+        return False
+    val = str(raw).strip().lower()
+    return val in {"1", "true", "yes", "on"}
+
+
+def _redact_secrets(text: str) -> str:
+    text = re.sub(r"(\b(api[_-]?key|secret|token|password|passwd|pwd)\b\s*[:=]\s*)(\S+)", r"\1[REDACTED]", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bsk-[A-Za-z0-9_-]{10,}\b", "sk-[REDACTED]", text)
+    text = re.sub(r"\bAIza[0-9A-Za-z_-]{10,}\b", "AIza[REDACTED]", text)
+    return text
+
+
+def _tool_was_clearly_requested(name: str, args: dict, user_text: str | None) -> bool:
+    if not user_text:
+        return False
+    low = user_text.lower()
+    if name == "open_app":
+        app = str(args.get("app_name", "")).lower()
+        return app in low or any(w in low for w in ["abra", "open", "lance", "start"])
+    if name == "file_controller":
+        act = args.get("action", "")
+        pth = str(args.get("path", "")).lower()
+        if act == "read" and any(w in low for w in ["leia", "read", pth]): return True
+        if act == "find" and any(w in low for w in ["procure", "find", pth]): return True
+        if act == "create_file" and any(w in low for w in ["crie", "create", "escreva"]):
+            return not any(x in pth for x in ["main.py", "config", ".env", ".gitignore", "windows", "system32"])
+        if act == "create_folder" and any(w in low for w in ["crie", "create", "pasta"]): return True
+    if name in ["web_search", "weather_report", "youtube_video", "flight_finder", "save_memory"]:
+        return True
+    return False
+
+
+def _classify_tool_call(name: str, args: dict, user_text: str | None) -> dict:
+    CRIT = ["main.py", "config", ".env", ".gitignore", "windows", "system32", "program files"]
+    DANG = ["rm -rf", "del /s", "format ", "mkfs", "dd if=", ":(){ :|:& };:", "shutdown /s", "reg delete"]
+    arg_str = str(args).lower()
+    if any(d in arg_str for d in DANG):
+        return {"action": "deny", "risk": "high", "reason": "destructive_command"}
+    if name == "file_controller":
+        act = args.get("action", "")
+        pth = str(args.get("path", "")).lower()
+        if act in ["delete", "move", "rename", "write"]:
+            if "all" in arg_str or "*" in pth or pth == "":
+                return {"action": "deny", "risk": "high", "reason": "bulk_file_operation"}
+            if any(c in pth for c in CRIT):
+                return {"action": "confirm", "risk": "medium", "reason": "critical_path_modification"}
+            return {"action": "confirm", "risk": "medium", "reason": f"file_{act}"}
+    if name == "code_helper" and args.get("action") in ["edit", "run", "build"]:
+        return {"action": "confirm", "risk": "medium", "reason": f"code_{args.get('action')}"}
+    if name == "computer_settings" and args.get("action") in ["restart", "shutdown"]:
+        return {"action": "confirm", "risk": "medium", "reason": "system_power"}
+    if not _tool_was_clearly_requested(name, args, user_text):
+        if name in ["open_app", "computer_control", "desktop_control"]:
+             return {"action": "confirm", "risk": "low", "reason": "unrequested_action"}
+    return {"action": "allow", "risk": "low", "reason": ""}
+
+
+def _format_tool_confirmation(name: str, args: dict, classification: dict) -> str:
+    arg_sum = _redact_secrets(str(args))
+    return (f"Sir, this request may change or remove something important: tool '{name}' with {arg_sum}. "
+            f"Risk: {classification['risk']} ({classification['reason']}). Confirm to proceed?")
+
+
+def _format_tool_denial(name: str, args: dict, classification: dict) -> str:
+    return (f"I cannot execute this as it is dangerous: {classification['reason']}. "
+            "Want me to explain the risks and suggest a safer alternative?")
+
+
+def _apply_tool_call_gate(name: str, args: dict, user_text: str | None = None) -> tuple[bool, str | None, str]:
+    if not _tool_call_gate_enabled():
+        return True, None, "allow"
+    cl = _classify_tool_call(name, args, user_text)
+    if cl["action"] == "allow": return True, None, "allow"
+    if cl["action"] == "confirm": return False, _format_tool_confirmation(name, args, cl), "confirm"
+    if cl["action"] == "deny": return False, _format_tool_denial(name, args, cl), "deny"
+    return True, None, "allow"
+
 TOOL_DECLARATIONS = [
     {
         "name": "open_app",
@@ -689,10 +770,13 @@ class JarvisLive:
         self._speaking_lock = threading.Lock()
         self.ui.on_text_command = self._on_text_command
         self._turn_done_event: asyncio.Event | None = None
+        self.last_user_text: str | None = None
 
     def _on_text_command(self, text: str):
         if not self._loop or not self.session:
             return
+
+        self.last_user_text = text
 
         # Phase 5B: Action Decision Gate
         allowed, msg = _apply_action_decision_gate(text)
@@ -775,6 +859,16 @@ class JarvisLive:
     async def _execute_tool(self, fc) -> types.FunctionResponse:
         name = fc.name
         args = dict(fc.args or {})
+
+        # Phase 5C: Smart Tool Call Safety Gate
+        allowed, msg, action = _apply_tool_call_gate(name, args, self.last_user_text)
+        if not allowed:
+            if msg:
+                self.speak(msg)
+            return types.FunctionResponse(
+                id=fc.id, name=name,
+                response={"result": "confirmation_required" if action == "confirm" else "denied", "error": msg}
+            )
 
         print(f"[JARVIS] 🔧 {name}  {args}")
         self.ui.set_state("THINKING")
@@ -980,6 +1074,7 @@ class JarvisLive:
                             full_in = " ".join(in_buf).strip()
                             if full_in:
                                 self.ui.write_log(f"You: {full_in}")
+                                self.last_user_text = full_in
                             in_buf = []
 
                             full_out = " ".join(out_buf).strip()
