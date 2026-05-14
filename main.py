@@ -226,6 +226,47 @@ def _execute_save_memory(category: str, key: str, value: str) -> tuple[bool, str
 
     return True, ""
 
+
+def _action_decision_gate_enabled() -> bool:
+    raw = os.environ.get("JARVIS_ACTION_DECISION_GATE")
+    if raw is None:
+        return False
+    val = str(raw).strip().lower()
+    return val in {"1", "true", "yes", "on"}
+
+
+def _format_action_confirmation(decision) -> str:
+    return (
+        f"Sir, this request seems to require a local action or file change ({decision.intent}). "
+        f"Reason: {decision.reason}. Please confirm explicitly before I proceed."
+    )
+
+
+def _format_action_denial(decision) -> str:
+    return (
+        f"I cannot execute this request because it was classified as high risk: {decision.reason}. "
+        f"Intent: {decision.intent}."
+    )
+
+
+def _apply_action_decision_gate(text: str) -> tuple[bool, str | None]:
+    if not _action_decision_gate_enabled():
+        return True, None
+
+    from core.action_decision_policy import decide_action_request
+    decision = decide_action_request(text)
+
+    if decision.action in {"allow", "answer_only"}:
+        return True, None
+
+    if decision.action == "confirm":
+        return False, _format_action_confirmation(decision)
+
+    if decision.action == "deny":
+        return False, _format_action_denial(decision)
+
+    return True, None
+
 TOOL_DECLARATIONS = [
     {
         "name": "open_app",
@@ -652,6 +693,14 @@ class JarvisLive:
     def _on_text_command(self, text: str):
         if not self._loop or not self.session:
             return
+
+        # Phase 5B: Action Decision Gate
+        allowed, msg = _apply_action_decision_gate(text)
+        if not allowed:
+            if msg:
+                self.speak(msg)
+            return
+
         asyncio.run_coroutine_threadsafe(
             self.session.send_client_content(
                 turns={"parts": [{"text": text}]},
