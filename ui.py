@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import os
@@ -1594,6 +1595,7 @@ class JarvisUI:
             self.set_state("LISTENING")
 
     def request_confirmation(self, text: str) -> asyncio.Future:
-        future = asyncio.Future()
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
         self._win._conf_req_sig.emit(text, future)
         return future
