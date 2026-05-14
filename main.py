@@ -183,6 +183,31 @@ def _execute_save_memory(category: str, key: str, value: str) -> tuple[bool, str
     if not (key and value):
         return True, ""
 
+    # Phase 4B: optional memory decision policy (JARVIS_MEMORY_DECISION_POLICY).
+    # Inlined here so AST-based tests can extract _execute_save_memory without extra top-level helpers.
+    _pol_raw = os.environ.get("JARVIS_MEMORY_DECISION_POLICY")
+    _policy_on = False
+    if _pol_raw is not None and str(_pol_raw).strip() != "":
+        _pls = str(_pol_raw).strip().lower()
+        if _pls not in {"", "0", "false", "no", "off"} and _pls in {"1", "true", "yes", "on"}:
+            _policy_on = True
+
+    if _policy_on:
+        from memory_engine.decision_policy import decide_memory_save
+
+        _proj = (os.environ.get("JARVIS_MEMORY_PROJECT") or "meu-jarvis").strip() or "meu-jarvis"
+        _decision = decide_memory_save(category=category, key=key, value=value, project=_proj)
+        if not _decision.should_save:
+            return False, f"skipped:{_decision.reason}"
+        _allow_review = str(os.environ.get("JARVIS_MEMORY_ALLOW_REVIEW_SAVE") or "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if _decision.requires_review and not _allow_review:
+            return False, "skipped:requires_review"
+
     try:
         if backend == "legacy":
             _save_memory_legacy(category, key, value)
@@ -710,13 +735,19 @@ class JarvisLive:
             key      = args.get("key", "")
             value    = args.get("value", "")
             ok, err = _execute_save_memory(category, key, value)
-            if ok and key and value:
+            if ok and (not err) and key and value:
                 print(f"[Memory] 💾 save_memory: {category}/{key} = {value}")
             if not self.ui.muted:
                 self.ui.set_state("LISTENING")
+            if err.startswith("skipped:"):
+                _save_res = "skipped"
+            elif ok:
+                _save_res = "ok"
+            else:
+                _save_res = "error"
             return types.FunctionResponse(
                 id=fc.id, name=name,
-                response={"result": "ok" if ok else "error", "error": err, "silent": True}
+                response={"result": _save_res, "error": err, "silent": True}
             )
 
         loop   = asyncio.get_event_loop()
