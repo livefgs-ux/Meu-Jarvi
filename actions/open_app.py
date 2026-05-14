@@ -1,3 +1,4 @@
+import os
 import time
 import subprocess
 import platform
@@ -32,6 +33,7 @@ _APP_ALIASES: dict[str, dict[str, str]] = {
     "vlc":                {"Windows": "vlc",                     "Darwin": "VLC",                  "Linux": "vlc"},
     "netflix":            {"Windows": "Netflix",                 "Darwin": "Netflix",              "Linux": "firefox"},
     "vscode":             {"Windows": "code",                    "Darwin": "Visual Studio Code",   "Linux": "code"},
+    "vs code":            {"Windows": "code",                    "Darwin": "Visual Studio Code",   "Linux": "code"},
     "visual studio code": {"Windows": "code",                    "Darwin": "Visual Studio Code",   "Linux": "code"},
     "code":               {"Windows": "code",                    "Darwin": "Visual Studio Code",   "Linux": "code"},
     "terminal":           {"Windows": "wt",                      "Darwin": "Terminal",             "Linux": "gnome-terminal"},
@@ -62,20 +64,69 @@ _APP_ALIASES: dict[str, dict[str, str]] = {
     "steam":              {"Windows": "steam",                   "Darwin": "Steam",                "Linux": "steam"},
     "epic":               {"Windows": "EpicGamesLauncher",       "Darwin": "Epic Games Launcher",  "Linux": "legendary"},
     "epic games":         {"Windows": "EpicGamesLauncher",       "Darwin": "Epic Games Launcher",  "Linux": "legendary"},
+    "internet explorer":  {"Windows": "iexplore.exe",            "Darwin": "Safari",               "Linux": "firefox"},
+    "ie":                 {"Windows": "iexplore.exe",            "Darwin": "Safari",               "Linux": "firefox"},
+    "iexplore":           {"Windows": "iexplore.exe",            "Darwin": "Safari",               "Linux": "firefox"},
+    "cursor":             {"Windows": "cursor",                  "Darwin": "Cursor",               "Linux": "cursor"},
 }
 
 
-def _normalize(raw: str) -> str:
-    key = raw.lower().strip()
+def resolve_app_command(app_name: str, system: str = _SYSTEM) -> dict:
+    key = app_name.lower().strip()
 
+    # Special Case: Internet Explorer on Windows
+    if system == "Windows" and key in ["internet explorer", "ie", "iexplore"]:
+        # We need to be careful not to resolve to explorer.exe
+        ie_exe = "iexplore.exe"
+        found = shutil.which(ie_exe)
+        if not found:
+            # Check common paths
+            for p in [
+                os.path.join(os.environ.get("ProgramFiles", "C:\\Program Files"), "Internet Explorer", ie_exe),
+                os.path.join(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)"), "Internet Explorer", ie_exe),
+            ]:
+                if os.path.exists(p):
+                    found = p
+                    break
+
+        if found:
+            return {"status": "ok", "command": ie_exe, "label": "Internet Explorer"}
+        else:
+            return {
+                "status": "error",
+                "message": "Internet Explorer was not found. Use Microsoft Edge or Edge IE mode."
+            }
+
+    # 1. Exact alias match
     if key in _APP_ALIASES:
-        return _APP_ALIASES[key].get(_SYSTEM, raw)
+        cmd = _APP_ALIASES[key].get(system, app_name)
+        return {"status": "ok", "command": cmd, "label": key}
 
+    # 2. Prevent "Internet Explorer" matching "explorer" alias
+    if "internet explorer" in key or "ie" == key:
+        # If we reached here, it wasn't caught by exact match or the special case failed
+        # We MUST NOT fall back to fuzzy matching "explorer"
+        return {
+            "status": "error",
+            "message": f"Could not resolve '{app_name}' to a valid executable."
+        }
+
+    # 3. Fuzzy match (only for non-ambiguous cases)
+    dangerous_fuzzy = ["explorer", "code", "cursor"]
     for alias_key, os_map in _APP_ALIASES.items():
+        if alias_key in dangerous_fuzzy:
+            continue
         if alias_key in key or key in alias_key:
-            return os_map.get(_SYSTEM, raw)
+            return {"status": "ok", "command": os_map.get(system, app_name), "label": alias_key}
 
-    return raw  
+    return {"status": "ok", "command": app_name, "label": app_name}
+
+
+def _normalize(raw: str) -> str:
+    res = resolve_app_command(raw)
+    if res["status"] == "ok":
+        return res["command"]
+    return raw # Fallback for now, but open_app should handle the error
 
 def _launch_windows(app_name: str) -> bool:
 
@@ -236,8 +287,12 @@ def open_app(
     if launcher is None:
         return f"Unsupported operating system: {_SYSTEM}"
 
-    normalized = _normalize(app_name)
-    print(f"[open_app] Launching: '{app_name}' → '{normalized}' ({_SYSTEM})")
+    res = resolve_app_command(app_name)
+    if res["status"] == "error":
+        return res["message"]
+
+    normalized = res["command"]
+    print(f"[open_app] Launching: '{app_name}' -> '{normalized}' ({_SYSTEM})")
 
     if player:
         player.write_log(f"[open_app] {app_name}")
