@@ -76,9 +76,9 @@ class _SysMetrics:
     def __init__(self):
         self.cpu  = 0.0
         self.mem  = 0.0
-        self.net  = 0.0   
-        self.gpu  = -1.0  
-        self.tmp  = -1.0  
+        self.net  = 0.0
+        self.gpu  = -1.0
+        self.tmp  = -1.0
         self._lock = threading.Lock()
         self._last_net = psutil.net_io_counters()
         self._last_net_t = time.time()
@@ -499,6 +499,77 @@ class HudCanvas(QWidget):
                 hgt = int(3 + 2 * math.sin(self._tick * 0.09 + i * 0.6))
                 cl  = qcol(C.BORDER_B)
             p.fillRect(QRectF(wx0 + i * bw, wy + 20 - hgt, bw - 1, hgt), cl)
+
+class ConfirmationWidget(QFrame):
+    result_signal = pyqtSignal(bool)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setStyleSheet(f"""
+            ConfirmationWidget {{
+                background: {C.PANEL2};
+                border: 1px solid {C.ACC};
+                border-radius: 6px;
+            }}
+            QLabel {{ border: none; background: transparent; }}
+        """)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        hdr = QHBoxLayout()
+        icon = QLabel("⚠️")
+        icon.setFont(QFont("Arial", 14))
+        hdr.addWidget(icon)
+
+        self.label = QLabel("CONFIRMATION REQUIRED")
+        self.label.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
+        self.label.setStyleSheet(f"color: {C.ACC};")
+        hdr.addWidget(self.label)
+        hdr.addStretch()
+        layout.addLayout(hdr)
+
+        self.desc = QLabel("")
+        self.desc.setFont(QFont("Courier New", 9))
+        self.desc.setStyleSheet(f"color: {C.WHITE};")
+        self.desc.setWordWrap(True)
+        self.desc.setMinimumHeight(40)
+        layout.addWidget(self.desc)
+
+        btn_row = QHBoxLayout(); btn_row.setSpacing(10)
+        self.approve_btn = QPushButton("APPROVE")
+        self.approve_btn.setFixedHeight(32)
+        self.approve_btn.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        self.approve_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.approve_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {C.GREEN_D}; color: {C.WHITE};
+                border-radius: 3px;
+            }}
+            QPushButton:hover {{ background: {C.GREEN}; }}
+        """)
+        self.approve_btn.clicked.connect(lambda: self.result_signal.emit(True))
+
+        self.deny_btn = QPushButton("DENY")
+        self.deny_btn.setFixedHeight(32)
+        self.deny_btn.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        self.deny_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.deny_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {C.RED}; color: {C.WHITE};
+                border-radius: 3px;
+            }}
+            QPushButton:hover {{ background: #ff5577; }}
+        """)
+        self.deny_btn.clicked.connect(lambda: self.result_signal.emit(False))
+
+        btn_row.addWidget(self.approve_btn)
+        btn_row.addWidget(self.deny_btn)
+        layout.addLayout(btn_row)
+
+    def set_details(self, text: str):
+        self.desc.setText(text)
 
 class MetricBar(QWidget):
 
@@ -987,6 +1058,7 @@ class SetupOverlay(QWidget):
 class MainWindow(QMainWindow):
     _log_sig   = pyqtSignal(str)
     _state_sig = pyqtSignal(str)
+    _conf_req_sig = pyqtSignal(str, object)
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -1003,6 +1075,7 @@ class MainWindow(QMainWindow):
         self.on_text_command  = None
         self._muted           = False
         self._current_file: str | None = None
+        self._pending_conf_future: asyncio.Future | None = None
 
         central = QWidget()
         central.setStyleSheet(f"background: {C.BG};")
@@ -1043,6 +1116,7 @@ class MainWindow(QMainWindow):
 
         self._log_sig.connect(self._log.append_log)
         self._state_sig.connect(self._apply_state)
+        self._conf_req_sig.connect(self._on_confirmation_requested)
 
         self._overlay: SetupOverlay | None = None
         self._ready = self._check_config()
@@ -1247,6 +1321,11 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(8, 8, 8, 8)
         lay.setSpacing(6)
 
+        self._conf_widget = ConfirmationWidget()
+        self._conf_widget.hide()
+        self._conf_widget.result_signal.connect(self._handle_conf_result)
+        lay.addWidget(self._conf_widget)
+
         def _sec(txt):
             l = QLabel(f"▸ {txt}")
             l.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
@@ -1447,6 +1526,18 @@ class MainWindow(QMainWindow):
         self._apply_state("LISTENING")
         self._log.append_log(f"SYS: Initialised. OS={os_name.upper()}. JARVIS online.")
 
+    def _on_confirmation_requested(self, text: str, future: asyncio.Future):
+        self._pending_conf_future = future
+        self._conf_widget.set_details(text)
+        self._conf_widget.show()
+
+    def _handle_conf_result(self, approved: bool):
+        self._conf_widget.hide()
+        if self._pending_conf_future:
+            loop = self._pending_conf_future.get_loop()
+            loop.call_soon_threadsafe(self._pending_conf_future.set_result, approved)
+            self._pending_conf_future = None
+
 class _RootShim:
     def __init__(self, app: QApplication):
         self._app = app
@@ -1501,3 +1592,8 @@ class JarvisUI:
     def stop_speaking(self):
         if not self.muted:
             self.set_state("LISTENING")
+
+    def request_confirmation(self, text: str) -> asyncio.Future:
+        future = asyncio.Future()
+        self._win._conf_req_sig.emit(text, future)
+        return future

@@ -863,14 +863,34 @@ class JarvisLive:
         # Phase 5C: Smart Tool Call Safety Gate
         allowed, msg, action = _apply_tool_call_gate(name, args, self.last_user_text)
         if not allowed:
-            if msg:
-                self.speak(msg)
-            return types.FunctionResponse(
-                id=fc.id, name=name,
-                response={"result": "confirmation_required" if action == "confirm" else "denied", "error": msg}
-            )
+            if action == "confirm":
+                # Phase 5E: Visual Confirmation
+                print(f"[GATE] Requesting confirmation for {name}...")
+                if msg:
+                    self.speak(msg)
 
-        print(f"[JARVIS] 🔧 {name}  {args}")
+                # Await user decision from UI
+                approved = await self.ui.request_confirmation(msg or f"Confirm tool {name}?")
+
+                if approved:
+                    print(f"[GATE] Approved by user: {name}")
+                    # Allowed to proceed
+                else:
+                    print(f"[GATE] Denied by user: {name}")
+                    return types.FunctionResponse(
+                        id=fc.id, name=name,
+                        response={"result": "denied", "error": "User denied the request."}
+                    )
+            else:
+                # Deny
+                if msg:
+                    self.speak(msg)
+                return types.FunctionResponse(
+                    id=fc.id, name=name,
+                    response={"result": "denied", "error": msg}
+                )
+
+        print(f"[JARVIS] TOOL: {name} {args}")
         self.ui.set_state("THINKING")
 
         if name == "save_memory":
@@ -879,7 +899,7 @@ class JarvisLive:
             value    = args.get("value", "")
             ok, err = _execute_save_memory(category, key, value)
             if ok and (not err) and key and value:
-                print(f"[Memory] 💾 save_memory: {category}/{key} = {value}")
+                print(f"[Memory]  save_memory: {category}/{key} = {value}")
             if not self.ui.muted:
                 self.ui.set_state("LISTENING")
             if err.startswith("skipped:"):
@@ -1001,7 +1021,7 @@ class JarvisLive:
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
 
-        print(f"[JARVIS] 📤 {name} → {str(result)[:80]}")
+        print(f"[JARVIS]  {name} -> {str(result)[:80]}")
         return types.FunctionResponse(
             id=fc.id, name=name,
             response={"result": result}
@@ -1038,7 +1058,7 @@ class JarvisLive:
                 while True:
                     await asyncio.sleep(0.1)
         except Exception as e:
-            print(f"[JARVIS] ❌ Mic: {e}")
+            print(f"[JARVIS]  Mic: {e}")
             raise
 
     async def _receive_audio(self):
@@ -1092,7 +1112,7 @@ class JarvisLive:
                             function_responses=fn_responses
                         )
         except Exception as e:
-            print(f"[JARVIS] ❌ Recv: {e}")
+            print(f"[JARVIS]  Recv: {e}")
             traceback.print_exc()
             raise
 
@@ -1126,7 +1146,7 @@ class JarvisLive:
                 self.set_speaking(True)
                 await asyncio.to_thread(stream.write, chunk)
         except Exception as e:
-            print(f"[JARVIS] ❌ Play: {e}")
+            print(f"[JARVIS]  Play: {e}")
             raise
         finally:
             self.set_speaking(False)
