@@ -185,6 +185,62 @@ class TestAddressingGateIntegration(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(jarvis.last_user_text, "abre o Cursor")
 
+    async def test_wake_word_only_emits_single_local_ack(self):
+        jarvis = self._make_jarvis()
+        response_one = self._make_response("Jarvis", turn_complete=False)
+        response_two = self._make_response("Jarvis", turn_complete=True)
+
+        await self._receive_two(jarvis, response_one, response_two)
+
+        sys_logs = [call.args[0] for call in jarvis.ui.write_log.call_args_list if call.args and str(call.args[0]).startswith("SYS:")]
+        self.assertEqual(len(sys_logs), 1)
+        self.assertIn("SYS: Sim?", sys_logs[0])
+        self.assertFalse(jarvis.speak.called)
+
+    async def test_presence_check_after_wake_emits_only_once(self):
+        jarvis = self._make_jarvis()
+        response_one = self._make_response("Jarvis", turn_complete=False)
+        response_two = self._make_response("tá me ouvindo?", turn_complete=False)
+        response_three = self._make_response("tá me ouvindo?", turn_complete=True)
+
+        await self._receive_three(jarvis, response_one, response_two, response_three)
+
+        sys_logs = [call.args[0] for call in jarvis.ui.write_log.call_args_list if call.args and str(call.args[0]).startswith("SYS:")]
+        self.assertLessEqual(len(sys_logs), 1)
+
+    async def test_local_ack_cooldown_does_not_block_real_command(self):
+        jarvis = self._make_jarvis()
+        response_one = self._make_response("Jarvis", turn_complete=False)
+        response_two = self._make_response("Jarvis", turn_complete=False)
+        response_three = self._make_response("abre o Cursor", tool_name="open_app", tool_args={"app_name": "Cursor"})
+        jarvis._execute_tool = AsyncMock(return_value=types.SimpleNamespace(response={"result": "ok"}))
+
+        await self._receive_three(jarvis, response_one, response_two, response_three)
+
+        jarvis._execute_tool.assert_called_once()
+        self.assertEqual(jarvis._execute_tool.call_args.args[0].name, "open_app")
+        self.assertEqual(jarvis.last_user_text, "abre o Cursor")
+
+    async def test_wake_word_end_command_still_accepted(self):
+        jarvis = self._make_jarvis()
+        response = self._make_response("abre o Cursor, Jarvis", tool_name="open_app", tool_args={"app_name": "Cursor"})
+        jarvis._execute_tool = AsyncMock(return_value=types.SimpleNamespace(response={"result": "ok"}))
+        await self._receive_once(jarvis, response)
+
+        jarvis._execute_tool.assert_called_once()
+        self.assertEqual(jarvis._execute_tool.call_args.args[0].name, "open_app")
+        self.assertEqual(jarvis.last_user_text, "abre o Cursor")
+
+    async def test_unaddressed_audio_still_no_model_no_tool(self):
+        jarvis = self._make_jarvis()
+        response = self._make_response("abre o VS Code", tool_name="open_app", tool_args={"app_name": "VS Code"})
+        jarvis._execute_tool = AsyncMock(return_value=types.SimpleNamespace(response={"result": "ok"}))
+        await self._receive_once(jarvis, response)
+
+        self.assertFalse(jarvis.speak.called)
+        jarvis.session.send_client_content.assert_not_called()
+        jarvis._execute_tool.assert_not_called()
+
     async def test_audio_followup_without_wake_word_and_not_armed_ignored(self):
         jarvis = self._make_jarvis()
         response = self._make_response("abre o VS Code", tool_name="open_app", tool_args={"app_name": "VS Code"})
@@ -367,8 +423,7 @@ class TestAddressingGateIntegration(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(jarvis.speak.called)
         jarvis.session.send_client_content.assert_not_called()
-        self.assertTrue(jarvis.ui.write_log.called)
-        self.assertTrue(any("SYS:" in str(call.args[0]) for call in jarvis.ui.write_log.call_args_list if call.args))
+        self.assertFalse(jarvis.ui.write_log.called)
 
     async def test_weak_followup_keeps_gate_armed(self):
         jarvis = self._make_jarvis()

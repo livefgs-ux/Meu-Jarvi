@@ -10,8 +10,9 @@ from typing import Iterable
 
 from core.voice_activation_state import (
     arm_voice_activation,
+    clear_armed_voice_activation,
+    is_duplicate_fragment,
     clear_followup_buffer,
-    clear_voice_activation,
     consume_voice_activation,
     flush_followup_buffer_if_ready,
     get_voice_activation_state,
@@ -332,7 +333,9 @@ def should_process_audio_utterance(
 
     if matched:
         stripped = strip_wake_word(raw, wake_words=wake_words)
-        clear_voice_activation()
+        if is_duplicate_fragment(raw):
+            return GateDecision(False, "duplicate_fragment", "", matched)
+        clear_armed_voice_activation()
         clear_followup_buffer()
         if not stripped:
             arm_voice_activation(matched, timeout_seconds=timeout_seconds, activation_text=raw)
@@ -349,7 +352,7 @@ def should_process_audio_utterance(
     if state.armed_until:
         now = time.time()
         if state.armed_until <= now:
-            clear_voice_activation()
+            clear_armed_voice_activation()
             clear_followup_buffer()
             return GateDecision(False, "armed_expired", "", state.matched_wake_word)
         buffered = " ".join(get_followup_buffer()).strip()
@@ -371,7 +374,6 @@ def should_process_audio_utterance(
         return GateDecision(False, "armed_non_meaningful", "", state.matched_wake_word)
 
     if is_presence_check(raw):
-        arm_voice_activation("presence_check", timeout_seconds=timeout_seconds, activation_text=raw)
-        return GateDecision(True, "presence_check", raw, "presence_check")
+        return GateDecision(False, "presence_check_idle", "", None)
 
     return GateDecision(False, "not_addressed", "", None)

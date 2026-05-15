@@ -91,9 +91,23 @@ class TestAddressingGate(unittest.TestCase):
 
     def test_presence_check_local_response_no_model(self):
         decision = should_process_audio_utterance("tá me ouvindo?")
-        self.assertTrue(decision.allowed)
-        self.assertEqual(decision.reason, "presence_check")
-        self.assertTrue(decision.stripped_text)
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason, "presence_check_idle")
+        self.assertEqual(decision.stripped_text, "")
+
+    def test_presence_check_in_idle_without_wake_is_ignored(self):
+        decision = should_process_audio_utterance("online?")
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason, "presence_check_idle")
+        self.assertEqual(decision.stripped_text, "")
+
+    def test_duplicate_wake_fragment_does_not_emit_presence_ack(self):
+        decision_one = should_process_audio_utterance("Jarvis")
+        decision_two = should_process_audio_utterance("Jarvis")
+        self.assertTrue(decision_one.allowed)
+        self.assertEqual(decision_one.reason, "wake_word_only")
+        self.assertFalse(decision_two.allowed)
+        self.assertEqual(decision_two.reason, "duplicate_fragment")
 
     def test_online_after_wake_does_not_consume_window(self):
         arm_voice_activation("jarvis", timeout_seconds=10.0, activation_text="Jarvis")
