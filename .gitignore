@@ -10,3 +10,5 @@ inicialmente.txt
 config/api_keys.json
 
 .local_test/
+
+.local_state/
