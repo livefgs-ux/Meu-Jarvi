@@ -15,6 +15,7 @@ from memory.memory_manager import (
     load_memory, update_memory, format_memory_for_prompt,
 )
 from memory_engine.runtime_context import build_readonly_memory_context_from_env
+from core.runtime_journal import record_event
 
 from actions.file_processor import file_processor
 from actions.flight_finder     import flight_finder
@@ -776,6 +777,7 @@ class JarvisLive:
         if not self._loop or not self.session:
             return
 
+        record_event("user_input", "text_command", text[:200], metadata={"input_type": "text"})
         self.last_user_text = text
 
         # Phase 5B: Action Decision Gate
@@ -859,6 +861,7 @@ class JarvisLive:
     async def _execute_tool(self, fc) -> types.FunctionResponse:
         name = fc.name
         args = dict(fc.args or {})
+        record_event("tool_called", name, f"Tool called: {name}", metadata=args, correlation_id=fc.id)
 
         # Phase 5C: Smart Tool Call Safety Gate
         allowed, msg, action = _apply_tool_call_gate(name, args, self.last_user_text)
@@ -870,13 +873,16 @@ class JarvisLive:
                     self.speak(msg)
 
                 # Await user decision from UI
+                record_event("confirmation_required", name, msg[:200] if msg else f"Confirm tool {name}?", metadata={"tool": name}, correlation_id=fc.id)
                 approved = await self.ui.request_confirmation(msg or f"Confirm tool {name}?")
 
                 if approved:
                     print(f"[GATE] Approved by user: {name}")
+                    record_event("confirmation_approved", name, f"User approved {name}", metadata={"tool": name}, correlation_id=fc.id)
                     # Allowed to proceed
                 else:
                     print(f"[GATE] Denied by user: {name}")
+                    record_event("confirmation_denied", name, f"User denied {name}", metadata={"tool": name}, correlation_id=fc.id)
                     return types.FunctionResponse(
                         id=fc.id, name=name,
                         response={"result": "denied", "error": "User denied the request."}
@@ -1015,6 +1021,7 @@ class JarvisLive:
 
         except Exception as e:
             result = f"Tool '{name}' failed: {e}"
+            record_event("tool_error", name, str(e)[:200], metadata={"tool": name}, severity="error", correlation_id=fc.id)
             traceback.print_exc()
             self.speak_error(name, e)
 
@@ -1022,6 +1029,18 @@ class JarvisLive:
             self.ui.set_state("LISTENING")
 
         print(f"[JARVIS]  {name} -> {str(result)[:80]}")
+
+        # Classification for journaling
+        event_type = "tool_result"
+        res_low = str(result).lower()
+        if name == "open_app":
+            if any(w in res_low for w in ["not found", "não foi encontrado"]): event_type = "app_not_found"
+            elif any(w in res_low for w in ["stale", "broken"]): event_type = "app_stale"
+            elif any(w in res_low for w in ["ambiguous", "mais de um"]): event_type = "app_ambiguous"
+            elif any(w in res_low for w in ["mismatch", "verification failed"]): event_type = "app_mismatch"
+
+        record_event(event_type, name, str(result)[:200], metadata={"tool": name}, correlation_id=fc.id)
+
         return types.FunctionResponse(
             id=fc.id, name=name,
             response={"result": result}
@@ -1093,6 +1112,7 @@ class JarvisLive:
 
                             full_in = " ".join(in_buf).strip()
                             if full_in:
+                                record_event("user_input", "audio_transcription", full_in[:200], metadata={"input_type": "audio"})
                                 self.ui.write_log(f"You: {full_in}")
                                 self.last_user_text = full_in
                             in_buf = []
