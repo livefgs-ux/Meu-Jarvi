@@ -4,6 +4,7 @@ import subprocess
 import platform
 import shutil
 from core.environment_state import get_active_window_info, verify_app_match
+from core.app_inventory import resolve_trusted_app
 
 try:
     import psutil
@@ -152,19 +153,6 @@ def _launch_windows(app_name: str) -> bool:
         except Exception:
             pass
 
-    try:
-        import pyautogui
-        pyautogui.PAUSE = 0.1
-        pyautogui.press("win")
-        time.sleep(0.7)
-        pyautogui.write(app_name, interval=0.05)
-        time.sleep(0.9)
-        pyautogui.press("enter")
-        time.sleep(2.5)
-        return True
-    except Exception as e:
-        print(f"[open_app] Start Menu search failed: {e}")
-
     return False
 
 
@@ -204,18 +192,6 @@ def _launch_macos(app_name: str) -> bool:
             return True
         except Exception:
             pass
-
-    try:
-        import pyautogui
-        pyautogui.hotkey("command", "space")
-        time.sleep(0.6)
-        pyautogui.write(app_name, interval=0.05)
-        time.sleep(0.8)
-        pyautogui.press("enter")
-        time.sleep(1.5)
-        return True
-    except Exception as e:
-        print(f"[open_app] Spotlight failed: {e}")
 
     return False
 
@@ -288,12 +264,29 @@ def open_app(
     if launcher is None:
         return f"Unsupported operating system: {_SYSTEM}"
 
-    res = resolve_app_command(app_name)
-    if res["status"] == "error":
-        return res["message"]
+    # Use Trusted App Resolver
+    trusted_res = resolve_trusted_app(app_name)
+    status = trusted_res["status"]
 
-    normalized = res["command"]
-    print(f"[open_app] Launching: '{app_name}' -> '{normalized}' ({_SYSTEM})")
+    if status == "not_found":
+        return f"Application '{app_name}' was not found in the trusted app inventory."
+
+    if status == "stale":
+        return f"Application '{app_name}' appears to have stale/broken installation entries."
+
+    if status == "ambiguous":
+        candidates = trusted_res.get("candidates", [])
+        names = ", ".join([c.name for c in candidates[:3]])
+        return f"Application '{app_name}' is ambiguous. Possible matches: {names}"
+
+    if status == "registry_only":
+        return f"Application '{app_name}' was found in registry but its executable path could not be verified."
+
+    # If we are here, status is running, installed_verified, or shortcut_valid
+    candidate = trusted_res["candidate"]
+    normalized = candidate.executable_path or candidate.command or candidate.name
+
+    print(f"[open_app] Launching Trusted: '{app_name}' -> '{normalized}' (Status: {status})")
 
     if player:
         player.write_log(f"[open_app] {app_name}")
@@ -301,7 +294,7 @@ def open_app(
     try:
         if launcher(normalized):
             # Best-effort verification
-            time.sleep(0.5)
+            time.sleep(1.0) # Increased slightly for reliability
             win = get_active_window_info()
             if win.get("status") == "ok":
                 observed_title = win.get("title", "")
@@ -315,13 +308,9 @@ def open_app(
 
             return f"Opened {app_name}."
 
-        if normalized.lower() != app_name.lower():
-            if launcher(app_name):
-                return f"Opened {app_name}."
-
         return (
             f"Could not confirm that {app_name} launched. "
-            f"It may still be loading, or it might not be installed."
+            f"The executable at '{normalized}' may have failed to start."
         )
     except Exception as e:
         print(f"[open_app] Error: {e}")

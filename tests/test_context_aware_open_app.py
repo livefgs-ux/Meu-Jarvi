@@ -7,6 +7,7 @@ from unittest.mock import patch, MagicMock
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from actions.open_app import open_app
+from core.app_inventory import AppCandidate
 
 class TestContextAwareOpenApp(unittest.TestCase):
 
@@ -24,9 +25,13 @@ class TestContextAwareOpenApp(unittest.TestCase):
             "process_name": "Cursor.exe"
         }
 
-        result = open_app({"app_name": "VS Code"})
-        self.assertIn("might not be VS Code", result)
-        self.assertIn("Detected: Cursor - main.py", result)
+        # Setup mock trusted resolver
+        mock_candidate = AppCandidate(name="VS Code", normalized_name="visual studio code", executable_path="C:\\Path\\To\\Code.exe", status="installed_verified")
+        with patch("actions.open_app.resolve_trusted_app") as mock_resolve:
+            mock_resolve.return_value = {"status": "installed_verified", "candidate": mock_candidate}
+            result = open_app({"app_name": "VS Code"})
+            self.assertIn("might not be VS Code", result)
+            self.assertIn("Detected: Cursor - main.py", result)
 
     @patch("actions.open_app._OS_LAUNCHERS")
     @patch("actions.open_app.get_active_window_info")
@@ -40,11 +45,10 @@ class TestContextAwareOpenApp(unittest.TestCase):
             "process_name": "explorer.exe"
         }
 
-        # We need to mock resolve_app_command to allow "Internet Explorer" if we want to reach verification
-        # actually resolve_app_command is already implemented and might error if not found.
-        # Let's mock resolve_app_command too to simulate a "found" but "wrong app opened" scenario
-        with patch("actions.open_app.resolve_app_command") as mock_resolve:
-            mock_resolve.return_value = {"status": "ok", "command": "iexplore.exe", "label": "Internet Explorer"}
+        # Setup mock trusted resolver
+        mock_candidate = AppCandidate(name="Internet Explorer", normalized_name="internet explorer", executable_path="C:\\Path\\To\\iexplore.exe", status="installed_verified")
+        with patch("actions.open_app.resolve_trusted_app") as mock_resolve:
+            mock_resolve.return_value = {"status": "installed_verified", "candidate": mock_candidate}
             result = open_app({"app_name": "Internet Explorer"})
             self.assertIn("might not be Internet Explorer", result)
 
@@ -60,8 +64,12 @@ class TestContextAwareOpenApp(unittest.TestCase):
             "process_name": "explorer.exe"
         }
 
-        result = open_app({"app_name": "File Explorer"})
-        self.assertEqual(result, "Opened File Explorer.")
+        # Setup mock trusted resolver
+        mock_candidate = AppCandidate(name="File Explorer", normalized_name="windows file explorer", executable_path="C:\\Windows\\explorer.exe", status="installed_verified")
+        with patch("actions.open_app.resolve_trusted_app") as mock_resolve:
+            mock_resolve.return_value = {"status": "installed_verified", "candidate": mock_candidate}
+            result = open_app({"app_name": "File Explorer"})
+            self.assertEqual(result, "Opened File Explorer.")
 
     @patch("actions.open_app._OS_LAUNCHERS")
     @patch("actions.open_app.get_active_window_info")
@@ -71,8 +79,12 @@ class TestContextAwareOpenApp(unittest.TestCase):
 
         mock_get_win.return_value = {"status": "unsupported_os"}
 
-        result = open_app({"app_name": "Chrome"})
-        self.assertEqual(result, "Opened Chrome.")
+        # Setup mock trusted resolver
+        mock_candidate = AppCandidate(name="Chrome", normalized_name="google chrome", executable_path="C:\\Path\\To\\chrome.exe", status="installed_verified")
+        with patch("actions.open_app.resolve_trusted_app") as mock_resolve:
+            mock_resolve.return_value = {"status": "installed_verified", "candidate": mock_candidate}
+            result = open_app({"app_name": "Chrome"})
+            self.assertEqual(result, "Opened Chrome.")
 
 if __name__ == "__main__":
     unittest.main()
