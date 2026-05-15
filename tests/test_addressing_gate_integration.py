@@ -37,6 +37,7 @@ class TestAddressingGateIntegration(unittest.IsolatedAsyncioTestCase):
         asyncio.set_event_loop(jarvis._loop)
         self._jarvis_loop = jarvis._loop
         jarvis.session = MagicMock()
+        jarvis.session.send_client_content = AsyncMock()
         jarvis.session.send_tool_response = AsyncMock()
         jarvis.speak = MagicMock()
         jarvis.audio_in_queue = asyncio.Queue()
@@ -103,9 +104,21 @@ class TestAddressingGateIntegration(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(jarvis.last_user_text)
         self.assertFalse(jarvis.speak.called)
+        jarvis.session.send_client_content.assert_not_called()
         jarvis._execute_tool.assert_not_called()
         event_types = [event.event_type for event in list_recent_events()]
         self.assertIn("user_utterance_ignored_not_addressed", event_types)
+
+    async def test_unaddressed_audio_does_not_send_to_gemini(self):
+        jarvis = self._make_jarvis()
+        response = self._make_response("tá me ouvindo?", tool_name="open_app", tool_args={"app_name": "Cursor"})
+        jarvis._execute_tool = AsyncMock(return_value=types.SimpleNamespace(response={"result": "ok"}))
+
+        await self._receive_once(jarvis, response)
+
+        jarvis.session.send_client_content.assert_not_called()
+        self.assertFalse(jarvis.speak.called)
+        jarvis._execute_tool.assert_not_called()
 
     async def test_audio_wake_word_only_does_not_call_tool(self):
         jarvis = self._make_jarvis()
@@ -114,17 +127,41 @@ class TestAddressingGateIntegration(unittest.IsolatedAsyncioTestCase):
         await self._receive_once(jarvis, response)
 
         jarvis._execute_tool.assert_not_called()
-        self.assertTrue(jarvis.speak.called)
-        self.assertEqual(jarvis.speak.call_args.args[0], "Sim?")
+        self.assertFalse(jarvis.speak.called)
+        jarvis.session.send_client_content.assert_not_called()
+        self.assertTrue(jarvis.ui.write_log.called)
+        self.assertIn("SYS: Sim?", " ".join(str(call.args[0]) for call in jarvis.ui.write_log.call_args_list))
 
-    async def test_audio_wake_word_only_speaks_short_ack(self):
+    async def test_wake_word_only_does_not_send_to_gemini(self):
+        jarvis = self._make_jarvis()
+        response = self._make_response("Jarvis")
+        jarvis._execute_tool = AsyncMock(return_value=types.SimpleNamespace(response={"result": "ok"}))
+
+        await self._receive_once(jarvis, response)
+
+        jarvis.session.send_client_content.assert_not_called()
+        self.assertFalse(jarvis.speak.called)
+
+    async def test_audio_wake_word_only_does_not_use_model_backed_speak(self):
         jarvis = self._make_jarvis()
         response = self._make_response("Jarvis")
         jarvis._execute_tool = AsyncMock(return_value=types.SimpleNamespace(response={"result": "ok"}))
         await self._receive_once(jarvis, response)
 
-        self.assertTrue(jarvis.speak.called)
-        self.assertEqual(jarvis.speak.call_args.args[0], "Sim?")
+        self.assertFalse(jarvis.speak.called)
+        jarvis.session.send_client_content.assert_not_called()
+        jarvis._execute_tool.assert_not_called()
+
+    async def test_weak_followup_does_not_send_to_gemini(self):
+        jarvis = self._make_jarvis()
+        response_one = self._make_response("Jarvis", turn_complete=False)
+        response_two = self._make_response("online", turn_complete=False)
+        jarvis._execute_tool = AsyncMock(return_value=types.SimpleNamespace(response={"result": "ok"}))
+
+        await self._receive_two(jarvis, response_one, response_two)
+
+        jarvis.session.send_client_content.assert_not_called()
+        self.assertFalse(jarvis.speak.called)
         jarvis._execute_tool.assert_not_called()
 
     async def test_audio_followup_after_wake_word_calls_existing_flow(self):
@@ -165,7 +202,8 @@ class TestAddressingGateIntegration(unittest.IsolatedAsyncioTestCase):
         await self._receive_two(jarvis, response_one, response_two)
 
         jarvis._execute_tool.assert_not_called()
-        self.assertTrue(jarvis.speak.called)
+        self.assertFalse(jarvis.speak.called)
+        jarvis.session.send_client_content.assert_not_called()
 
     async def test_jarvis_then_noise_then_open_cursor_still_works(self):
         jarvis = self._make_jarvis()
@@ -178,6 +216,7 @@ class TestAddressingGateIntegration(unittest.IsolatedAsyncioTestCase):
         jarvis._execute_tool.assert_called_once()
         self.assertEqual(jarvis._execute_tool.call_args.args[0].name, "open_app")
         self.assertEqual(jarvis.last_user_text, "abre o Cursor")
+        jarvis.session.send_client_content.assert_not_called()
 
     async def test_jarvis_then_weak_followup_then_open_cursor_still_works(self):
         jarvis = self._make_jarvis()
@@ -195,8 +234,22 @@ class TestAddressingGateIntegration(unittest.IsolatedAsyncioTestCase):
         jarvis._execute_tool.assert_called_once()
         self.assertEqual(jarvis._execute_tool.call_args.args[0].name, "open_app")
         self.assertEqual(jarvis.last_user_text, "abre o Cursor")
+        jarvis.session.send_client_content.assert_not_called()
         event_types = [event.event_type for event in list_recent_events()]
         self.assertIn("ignored_non_meaningful_followup", event_types)
+
+    async def test_weak_followup_keeps_armed_window(self):
+        jarvis = self._make_jarvis()
+        response_one = self._make_response("Jarvis", turn_complete=False)
+        response_two = self._make_response("online", turn_complete=False)
+        response_three = self._make_response("abre o Cursor", tool_name="open_app", tool_args={"app_name": "Cursor"})
+        jarvis._execute_tool = AsyncMock(return_value=types.SimpleNamespace(response={"result": "ok"}))
+
+        await self._receive_three(jarvis, response_one, response_two, response_three)
+
+        jarvis._execute_tool.assert_called_once()
+        self.assertEqual(jarvis._execute_tool.call_args.args[0].name, "open_app")
+        jarvis.session.send_client_content.assert_not_called()
 
     async def test_open_app_after_wake_word_then_command_is_called(self):
         jarvis = self._make_jarvis()
@@ -208,6 +261,7 @@ class TestAddressingGateIntegration(unittest.IsolatedAsyncioTestCase):
         jarvis._execute_tool.assert_called_once()
         self.assertEqual(jarvis._execute_tool.call_args.args[0].name, "open_app")
         self.assertEqual(jarvis.last_user_text, "abre o Cursor")
+        jarvis.session.send_client_content.assert_not_called()
 
     async def test_web_search_after_wake_word_then_command_is_called(self):
         jarvis = self._make_jarvis()
@@ -219,6 +273,7 @@ class TestAddressingGateIntegration(unittest.IsolatedAsyncioTestCase):
         jarvis._execute_tool.assert_called_once()
         self.assertEqual(jarvis._execute_tool.call_args.args[0].name, "web_search")
         self.assertEqual(jarvis.last_user_text, "pesquisa novidades sobre IA")
+        jarvis.session.send_client_content.assert_not_called()
 
     async def test_stop_speech_still_works_without_wake_word_when_speaking(self):
         jarvis = self._make_jarvis()
@@ -228,6 +283,7 @@ class TestAddressingGateIntegration(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(jarvis._speech_control_state.is_silenced)
         self.assertFalse(jarvis.speak.called)
+        jarvis.session.send_client_content.assert_not_called()
         event_types = [event.event_type for event in list_recent_events()]
         self.assertIn("speech_interrupted", event_types)
 
@@ -250,6 +306,17 @@ class TestAddressingGateIntegration(unittest.IsolatedAsyncioTestCase):
             await self._receive_once(jarvis, response)
 
         jarvis._execute_tool.assert_not_called()
+        self.assertFalse(jarvis.speak.called)
+        jarvis.session.send_client_content.assert_not_called()
+
+    async def test_ignored_audio_does_not_call_save_memory(self):
+        jarvis = self._make_jarvis()
+        response = self._make_response("online", tool_name="save_memory", tool_args={"category": "notes", "key": "k", "value": "v"})
+        with patch("main._execute_save_memory") as execute_save_memory:
+            await self._receive_once(jarvis, response)
+
+        execute_save_memory.assert_not_called()
+        jarvis.session.send_client_content.assert_not_called()
         self.assertFalse(jarvis.speak.called)
 
     async def test_debug_logs_for_armed_and_ignored_weak_followup(self):

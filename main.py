@@ -901,6 +901,10 @@ class JarvisLive:
             except Exception:
                 break
 
+    def _local_audio_acknowledge(self, message: str) -> None:
+        self._safe_write_log(f"SYS: {message}")
+        self._safe_set_state("LISTENING")
+
     def _stop_current_speech(self):
         self._suppress_audio_until_turn_complete = True
         self._clear_audio_output_queue()
@@ -1611,7 +1615,7 @@ class JarvisLive:
                                         clear_followup_buffer()
                                         in_buf = []
                                         current_audio_chunks = []
-                                        self.speak("Sim?")
+                                        self._local_audio_acknowledge("Sim?")
                                     elif decision.reason == "armed_followup":
                                         if buffered:
                                             print(f"[AddressingGate] buffered command accepted: '{decision.stripped_text}'")
