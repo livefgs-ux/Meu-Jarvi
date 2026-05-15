@@ -872,6 +872,8 @@ class JarvisLive:
         self._current_audio_turn_ignored = False
         self._current_audio_turn_ignore_reason: str | None = None
         self._current_audio_turn_wake_word_only = False
+        self._addressing_idle_last_log_at = 0.0
+        self._addressing_idle_log_suppressed = 0
 
     def _safe_set_state(self, state: str):
         try:
@@ -904,6 +906,32 @@ class JarvisLive:
     def _local_audio_acknowledge(self, message: str) -> None:
         self._safe_write_log(f"SYS: {message}")
         self._safe_set_state("LISTENING")
+
+    def _local_presence_acknowledge(self, text: str) -> None:
+        normalized = _clean_transcript(text).lower()
+        if any(needle in normalized for needle in ("ouv", "escut", "me ouve")):
+            message = "Estou ouvindo."
+        elif any(needle in normalized for needle in ("online", "online?", "online.")):
+            message = "Estou aqui."
+        elif any(needle in normalized for needle in ("cad", "ai", "alô", "alo")):
+            message = "Estou aqui."
+        else:
+            message = "Sim?"
+        self._local_audio_acknowledge(message)
+
+    def _log_addressing_idle_ignored(self, reason: str = "not_addressed") -> None:
+        now = time.time()
+        interval = 1.5
+        if now - self._addressing_idle_last_log_at < interval:
+            self._addressing_idle_log_suppressed += 1
+            return
+
+        suffix = ""
+        if self._addressing_idle_log_suppressed:
+            suffix = f" (x{self._addressing_idle_log_suppressed} suppressed)"
+        print(f"[AddressingGate] state=IDLE ignored: {reason}{suffix}")
+        self._addressing_idle_last_log_at = now
+        self._addressing_idle_log_suppressed = 0
 
     def _stop_current_speech(self):
         self._suppress_audio_until_turn_complete = True
@@ -1589,7 +1617,7 @@ class JarvisLive:
                                         )
                                     buffered = " ".join(get_followup_buffer()).strip()
                                     candidate = " ".join(part for part in [buffered, txt] if part).strip()
-                                    decision = self._apply_addressing_gate(candidate if buffered else txt, source="audio")
+                                    decision = self._apply_addressing_gate(txt, source="audio")
 
                                     if decision is None:
                                         in_buf = []
@@ -1607,15 +1635,46 @@ class JarvisLive:
                                                 "timeout_seconds": 10.0,
                                             },
                                         )
-                                        self._current_audio_turn_ignored = False
-                                        self._current_audio_turn_ignore_reason = None
+                                        self._current_audio_turn_ignored = True
+                                        self._current_audio_turn_ignore_reason = "wake_word_only"
                                         self._current_audio_turn_wake_word_only = True
                                         self._suppress_audio_until_turn_complete = True
                                         response_allows_tools = False
+                                        self._clear_audio_output_queue()
                                         clear_followup_buffer()
                                         in_buf = []
                                         current_audio_chunks = []
                                         self._local_audio_acknowledge("Sim?")
+                                    elif decision.reason in {"presence_check", "armed_presence_check"}:
+                                        wake_word = (decision.matched_wake_word or "presence").strip()
+                                        print(f"[AddressingGate] presence check detected: {wake_word}")
+                                        record_event(
+                                            "voice_activation_armed",
+                                            "AddressingGate",
+                                            decision.stripped_text[:200],
+                                            metadata={
+                                                "source": "audio",
+                                                "wake_word": wake_word,
+                                                "timeout_seconds": 10.0,
+                                                "presence_check": True,
+                                            },
+                                        )
+                                        self._current_audio_turn_ignored = True
+                                        self._current_audio_turn_ignore_reason = "presence_check"
+                                        self._current_audio_turn_wake_word_only = False
+                                        self._suppress_audio_until_turn_complete = True
+                                        response_allows_tools = False
+                                        self._clear_audio_output_queue()
+                                        self._local_presence_acknowledge(decision.stripped_text)
+                                        if decision.reason == "presence_check":
+                                            clear_followup_buffer()
+                                            arm_voice_activation(
+                                                wake_word,
+                                                timeout_seconds=10.0,
+                                                activation_text=decision.stripped_text or txt,
+                                            )
+                                        in_buf = []
+                                        current_audio_chunks = []
                                     elif decision.reason == "armed_followup":
                                         if buffered:
                                             print(f"[AddressingGate] buffered command accepted: '{decision.stripped_text}'")
@@ -1692,15 +1751,17 @@ class JarvisLive:
                                         self._current_audio_turn_wake_word_only = False
                                         self._suppress_audio_until_turn_complete = True
                                         response_allows_tools = False
+                                        self._clear_audio_output_queue()
                                         in_buf = []
                                         current_audio_chunks = []
                                     else:
-                                        print("[AddressingGate] state=IDLE ignored: not addressed")
+                                        self._log_addressing_idle_ignored(decision.reason or "not_addressed")
                                         self._current_audio_turn_ignored = True
                                         self._current_audio_turn_ignore_reason = decision.reason or "not_addressed"
                                         self._current_audio_turn_wake_word_only = False
                                         self._suppress_audio_until_turn_complete = True
                                         response_allows_tools = False
+                                        self._clear_audio_output_queue()
                                         clear_followup_buffer()
                                         in_buf = []
 

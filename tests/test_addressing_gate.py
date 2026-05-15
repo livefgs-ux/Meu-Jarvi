@@ -26,10 +26,16 @@ class TestAddressingGate(unittest.TestCase):
         clear_voice_activation()
         clear_followup_buffer()
 
-    def test_jarvis_prefix_allows(self):
-        decision = should_process_user_utterance("Jarvis, abre o VS Code")
+    def test_wake_word_at_start_accepts_command(self):
+        decision = should_process_audio_utterance("Jarvis, abre o VS Code")
         self.assertTrue(decision.allowed)
         self.assertEqual(decision.stripped_text, "abre o VS Code")
+        self.assertEqual(decision.matched_wake_word, "jarvis")
+
+    def test_wake_word_at_end_accepts_command(self):
+        decision = should_process_audio_utterance("abre o Cursor, Jarvis")
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.stripped_text, "abre o Cursor")
         self.assertEqual(decision.matched_wake_word, "jarvis")
 
     def test_charles_prefix_allows(self):
@@ -77,17 +83,23 @@ class TestAddressingGate(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.reason, "empty_text")
 
-    def test_wake_word_only_does_not_call_model(self):
+    def test_wake_word_only_local_ack_no_model(self):
         decision = should_process_audio_utterance("Jarvis")
         self.assertTrue(decision.allowed)
         self.assertEqual(decision.reason, "wake_word_only")
         self.assertEqual(decision.stripped_text, "")
 
+    def test_presence_check_local_response_no_model(self):
+        decision = should_process_audio_utterance("tá me ouvindo?")
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.reason, "presence_check")
+        self.assertTrue(decision.stripped_text)
+
     def test_online_after_wake_does_not_consume_window(self):
         arm_voice_activation("jarvis", timeout_seconds=10.0, activation_text="Jarvis")
         decision = should_process_audio_utterance("online")
-        self.assertFalse(decision.allowed)
-        self.assertEqual(decision.reason, "armed_non_meaningful")
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.reason, "armed_presence_check")
         self.assertTrue(get_voice_activation_state().armed_until > 0)
 
     def test_noise_after_wake_does_not_consume_window(self):
@@ -100,15 +112,15 @@ class TestAddressingGate(unittest.TestCase):
     def test_listening_phrase_after_wake_does_not_consume_window(self):
         arm_voice_activation("jarvis", timeout_seconds=10.0, activation_text="Jarvis")
         decision = should_process_audio_utterance("tá ouvindo")
-        self.assertFalse(decision.allowed)
-        self.assertEqual(decision.reason, "armed_non_meaningful")
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.reason, "armed_presence_check")
         self.assertTrue(get_voice_activation_state().armed_until > 0)
 
     def test_me_ouvindo_after_wake_does_not_consume_window(self):
         arm_voice_activation("jarvis", timeout_seconds=10.0, activation_text="Jarvis")
         decision = should_process_audio_utterance("tá me ouvindo?")
-        self.assertFalse(decision.allowed)
-        self.assertEqual(decision.reason, "armed_non_meaningful")
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.reason, "armed_presence_check")
         self.assertTrue(get_voice_activation_state().armed_until > 0)
 
     def test_meaningful_followup_consumes_window(self):
@@ -133,6 +145,14 @@ class TestAddressingGate(unittest.TestCase):
         self.assertEqual(decision.reason, "armed_fragment")
         append_followup_fragment("abre")
         self.assertEqual(get_followup_buffer(), ("abre",))
+
+    def test_fragmented_stt_buffer_accepts_late_command(self):
+        with patch("core.voice_activation_state.time.time", return_value=100.0):
+            arm_voice_activation("jarvis", timeout_seconds=10.0, activation_text="Jarvis")
+            append_followup_fragment("abre")
+            append_followup_fragment("o Cursor")
+        flushed = flush_followup_buffer_if_ready(now=102.0)
+        self.assertEqual(flushed, "abre o Cursor")
 
     def test_buffer_expires_without_calling_model(self):
         with patch("core.voice_activation_state.time.time", return_value=100.0):

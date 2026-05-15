@@ -235,8 +235,6 @@ class TestAddressingGateIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(jarvis._execute_tool.call_args.args[0].name, "open_app")
         self.assertEqual(jarvis.last_user_text, "abre o Cursor")
         jarvis.session.send_client_content.assert_not_called()
-        event_types = [event.event_type for event in list_recent_events()]
-        self.assertIn("ignored_non_meaningful_followup", event_types)
 
     async def test_weak_followup_keeps_armed_window(self):
         jarvis = self._make_jarvis()
@@ -338,7 +336,78 @@ class TestAddressingGateIntegration(unittest.IsolatedAsyncioTestCase):
 
         printed = " ".join(str(call.args[0]) for call in fake_print.call_args_list if call.args)
         self.assertIn("wake word only -> armed for 10s", printed)
-        self.assertIn("weak follow-up ignored, still armed", printed)
+        self.assertIn("presence check detected", printed)
+
+    async def test_wake_word_at_start_accepts_command(self):
+        jarvis = self._make_jarvis()
+        response = self._make_response("Jarvis, abre o Cursor", tool_name="open_app", tool_args={"app_name": "Cursor"})
+        jarvis._execute_tool = AsyncMock(return_value=types.SimpleNamespace(response={"result": "ok"}))
+        await self._receive_once(jarvis, response)
+
+        jarvis._execute_tool.assert_called_once()
+        self.assertEqual(jarvis._execute_tool.call_args.args[0].name, "open_app")
+        self.assertEqual(jarvis.last_user_text, "abre o Cursor")
+        jarvis.session.send_client_content.assert_not_called()
+
+    async def test_wake_word_at_end_accepts_command(self):
+        jarvis = self._make_jarvis()
+        response = self._make_response("abre o Cursor, Jarvis", tool_name="open_app", tool_args={"app_name": "Cursor"})
+        jarvis._execute_tool = AsyncMock(return_value=types.SimpleNamespace(response={"result": "ok"}))
+        await self._receive_once(jarvis, response)
+
+        jarvis._execute_tool.assert_called_once()
+        self.assertEqual(jarvis._execute_tool.call_args.args[0].name, "open_app")
+        self.assertEqual(jarvis.last_user_text, "abre o Cursor")
+        jarvis.session.send_client_content.assert_not_called()
+
+    async def test_presence_check_local_response_no_model(self):
+        jarvis = self._make_jarvis()
+        response = self._make_response("tá me ouvindo?")
+        await self._receive_once(jarvis, response)
+
+        self.assertFalse(jarvis.speak.called)
+        jarvis.session.send_client_content.assert_not_called()
+        self.assertTrue(jarvis.ui.write_log.called)
+        self.assertTrue(any("SYS:" in str(call.args[0]) for call in jarvis.ui.write_log.call_args_list if call.args))
+
+    async def test_weak_followup_keeps_gate_armed(self):
+        jarvis = self._make_jarvis()
+        response_one = self._make_response("Jarvis", turn_complete=False)
+        response_two = self._make_response("online", turn_complete=False)
+        response_three = self._make_response("abre o Cursor", tool_name="open_app", tool_args={"app_name": "Cursor"})
+        jarvis._execute_tool = AsyncMock(return_value=types.SimpleNamespace(response={"result": "ok"}))
+        await self._receive_three(jarvis, response_one, response_two, response_three)
+
+        jarvis._execute_tool.assert_called_once()
+        self.assertEqual(jarvis._execute_tool.call_args.args[0].name, "open_app")
+        self.assertEqual(jarvis.last_user_text, "abre o Cursor")
+        jarvis.session.send_client_content.assert_not_called()
+
+    async def test_fragmented_stt_buffer_accepts_late_command(self):
+        jarvis = self._make_jarvis()
+        response_one = self._make_response("Jarvis", turn_complete=False)
+        response_two = self._make_response("abre", turn_complete=False)
+        response_three = self._make_response("o Cursor", tool_name="open_app", tool_args={"app_name": "Cursor"}, turn_complete=True)
+        jarvis._execute_tool = AsyncMock(return_value=types.SimpleNamespace(response={"result": "ok"}))
+        await self._receive_three(jarvis, response_one, response_two, response_three)
+
+        jarvis._execute_tool.assert_called_once()
+        self.assertEqual(jarvis._execute_tool.call_args.args[0].name, "open_app")
+        self.assertEqual(jarvis.last_user_text, "abre o Cursor")
+        jarvis.session.send_client_content.assert_not_called()
+
+    async def test_ignored_logs_are_rate_limited(self):
+        jarvis = self._make_jarvis()
+        with patch("main.time.time", side_effect=[100.0, 100.1, 100.2, 102.0]):
+            with patch("builtins.print") as fake_print:
+                jarvis._log_addressing_idle_ignored("not_addressed")
+                jarvis._log_addressing_idle_ignored("not_addressed")
+                jarvis._log_addressing_idle_ignored("not_addressed")
+                jarvis._log_addressing_idle_ignored("not_addressed")
+
+        printed = [call.args[0] for call in fake_print.call_args_list if call.args]
+        idle_logs = [line for line in printed if "state=IDLE ignored" in str(line)]
+        self.assertLessEqual(len(idle_logs), 2)
 
 
 if __name__ == "__main__":

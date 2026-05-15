@@ -32,6 +32,20 @@ DEFAULT_WAKE_WORDS = (
 )
 
 _LEADING_FILLERS = {"oi", "ola", "hey", "ei", "ok", "okay", "por favor", "pf"}
+_PRESENCE_PHRASES = {
+    "cade voce",
+    "voce esta ai",
+    "ta me ouvindo",
+    "ta ouvindo",
+    "esta online",
+    "online",
+    "alo",
+    "me escuta",
+    "me ouve",
+    "voce esta online",
+    "voce ta ai",
+    "voce esta ouvindo",
+}
 _NOISE_PHRASES = {
     "sim",
     "online",
@@ -154,31 +168,39 @@ def _wake_word_phrases(wake_words: Iterable[str] | None = None) -> list[list[str
     return [_normalize_token(phrase).split() for phrase in phrases if _normalize_token(phrase)]
 
 
-def _match_wake_word_tokens(tokens: list[str], wake_words: Iterable[str] | None = None) -> tuple[str | None, int]:
+def _find_wake_word_span(
+    tokens: list[str],
+    wake_words: Iterable[str] | None = None,
+) -> tuple[str | None, int, int]:
     norm_tokens = [_normalize_token(tok) for tok in tokens]
     phrases = _wake_word_phrases(wake_words)
 
-    for filler_count in range(0, min(2, len(norm_tokens)) + 1):
-        if filler_count:
-            leading = " ".join(norm_tokens[:filler_count]).strip()
-            if leading not in _LEADING_FILLERS:
-                continue
-
-        start = filler_count
+    for start in range(len(norm_tokens)):
+        if start:
+            leading = " ".join(norm_tokens[:start]).strip()
+            if leading and not leading.endswith(tuple(_LEADING_FILLERS)):
+                pass
         for phrase_tokens in phrases:
             if not phrase_tokens:
                 continue
             end = start + len(phrase_tokens)
             if norm_tokens[start:end] == phrase_tokens:
                 matched = " ".join(phrase_tokens)
-                return matched, end
+                return matched, start, end
 
-    return None, 0
+    return None, -1, -1
+
+
+def _match_wake_word_tokens(tokens: list[str], wake_words: Iterable[str] | None = None) -> tuple[str | None, int]:
+    matched, start, end = _find_wake_word_span(tokens, wake_words=wake_words)
+    if not matched:
+        return None, 0
+    return matched, end
 
 
 def is_addressed_to_jarvis(text: str, wake_words: list[str] | None = None) -> bool:
     tokens = _tokens(text)
-    matched, _ = _match_wake_word_tokens(tokens, wake_words=wake_words)
+    matched, _, _ = _find_wake_word_span(tokens, wake_words=wake_words)
     return matched is not None
 
 
@@ -188,12 +210,28 @@ def strip_wake_word(text: str, wake_words: list[str] | None = None) -> str:
         return ""
 
     tokens = _tokens(raw)
-    matched, consumed = _match_wake_word_tokens(tokens, wake_words=wake_words)
+    matched, start, end = _find_wake_word_span(tokens, wake_words=wake_words)
     if not matched:
         return raw
 
-    stripped_tokens = tokens[consumed:]
+    stripped_tokens = tokens[:start] + tokens[end:]
     return " ".join(stripped_tokens).strip()
+
+
+def is_presence_check(text: str) -> bool:
+    raw = normalize_address_text(text)
+    if not raw:
+        return False
+
+    stripped = raw
+    if any(phrase in stripped for phrase in _PRESENCE_PHRASES):
+        return True
+
+    tokens = stripped.split()
+    if len(tokens) <= 2 and stripped in _PRESENCE_PHRASES:
+        return True
+
+    return False
 
 
 def is_meaningful_followup(text: str) -> bool:
@@ -288,7 +326,7 @@ def should_process_audio_utterance(
 
     try:
         tokens = _tokens(raw)
-        matched, _ = _match_wake_word_tokens(tokens, wake_words=wake_words)
+        matched, start, end = _find_wake_word_span(tokens, wake_words=wake_words)
     except Exception as exc:  # fail closed for audio
         return GateDecision(False, f"gate_error:{exc}", "", None)
 
@@ -297,6 +335,12 @@ def should_process_audio_utterance(
         clear_voice_activation()
         clear_followup_buffer()
         if not stripped:
+            arm_voice_activation(matched, timeout_seconds=timeout_seconds, activation_text=raw)
+            return GateDecision(True, "wake_word_only", "", matched)
+        if is_presence_check(stripped):
+            arm_voice_activation(matched, timeout_seconds=timeout_seconds, activation_text=raw)
+            return GateDecision(True, "presence_check", stripped, matched)
+        if not is_meaningful_followup(stripped) and _is_bufferable_fragment(stripped):
             arm_voice_activation(matched, timeout_seconds=timeout_seconds, activation_text=raw)
             return GateDecision(True, "wake_word_only", "", matched)
         return GateDecision(True, "wake_word_matched", stripped, matched)
@@ -310,6 +354,10 @@ def should_process_audio_utterance(
             return GateDecision(False, "armed_expired", "", state.matched_wake_word)
         buffered = " ".join(get_followup_buffer()).strip()
         candidate = " ".join(part for part in [buffered, raw] if part).strip()
+        if is_presence_check(candidate):
+            if buffered:
+                flush_followup_buffer_if_ready(now=now)
+            return GateDecision(True, "armed_presence_check", candidate, state.matched_wake_word)
         if candidate and is_meaningful_followup(candidate):
             if consume_voice_activation():
                 clear_followup_buffer()
@@ -321,5 +369,9 @@ def should_process_audio_utterance(
         if buffered:
             flush_followup_buffer_if_ready(now=now)
         return GateDecision(False, "armed_non_meaningful", "", state.matched_wake_word)
+
+    if is_presence_check(raw):
+        arm_voice_activation("presence_check", timeout_seconds=timeout_seconds, activation_text=raw)
+        return GateDecision(True, "presence_check", raw, "presence_check")
 
     return GateDecision(False, "not_addressed", "", None)
