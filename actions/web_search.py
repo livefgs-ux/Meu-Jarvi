@@ -30,7 +30,8 @@ def _build_search_prompt(query: str) -> str:
         f"{portuguese_default_instruction()}\n"
         f"{tool_truthfulness_instruction()}\n"
         "Resuma direto, em português brasileiro, mesmo se a fonte estiver em outro idioma.\n"
-        "Se houver comparação, seja objetivo e mantenha a resposta curta.\n\n"
+        "Se houver comparação, seja objetivo e mantenha a resposta curta.\n"
+        "Não prometa pesquisa, abertura ou execução sem a chamada real da ferramenta.\n\n"
         f"Consulta: {query}"
     )
 

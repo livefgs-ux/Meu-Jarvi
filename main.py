@@ -23,12 +23,14 @@ from core.intent_confidence import (
     validate_tool_call_against_user_text,
 )
 from core.response_discipline import (
+    addressing_gate_instruction,
     concise_clarification,
     enforce_portuguese_local_reply,
     is_explicit_language_change_request,
     portuguese_default_instruction,
     tool_truthfulness_instruction,
 )
+from core.addressing_gate import should_process_user_utterance, strip_wake_word
 from core.speech_control import (
     SpeechCommandType,
     SpeechControlState,
@@ -858,6 +860,8 @@ class JarvisLive:
         self.resilience = LiveResilienceSupervisor()
         self._speech_control_state = SpeechControlState()
         self._suppress_audio_until_turn_complete = False
+        self._current_audio_turn_ignored = False
+        self._current_audio_turn_ignore_reason: str | None = None
 
     def _safe_set_state(self, state: str):
         try:
@@ -997,8 +1001,44 @@ class JarvisLive:
                 return True
         except Exception as e:
             print(f"[JARVIS] Context awareness error (fail-open): {e}")
-            
+
         return False
+
+    def _apply_addressing_gate(self, text: str, *, source: str = "audio") -> tuple[bool, str]:
+        mic_mode = source == "audio"
+        try:
+            decision = should_process_user_utterance(
+                text,
+                mic_mode=mic_mode,
+                text_input_always_allowed=True,
+            )
+        except Exception as exc:
+            record_event(
+                "addressing_gate_error",
+                "AddressingGate",
+                str(exc)[:200],
+                metadata={"source": source},
+                severity="error",
+            )
+            if mic_mode:
+                self._current_audio_turn_ignored = True
+                self._current_audio_turn_ignore_reason = "gate_error"
+                self._suppress_audio_until_turn_complete = True
+                return False, ""
+            return True, text
+
+        if decision.allowed:
+            if mic_mode:
+                self._current_audio_turn_ignored = False
+                self._current_audio_turn_ignore_reason = None
+            stripped = strip_wake_word(text) if mic_mode else (decision.stripped_text or text)
+            return True, stripped
+
+        if mic_mode:
+            self._current_audio_turn_ignored = True
+            self._current_audio_turn_ignore_reason = decision.reason
+            self._suppress_audio_until_turn_complete = True
+        return False, ""
 
     def _on_text_command(self, text: str):
         if not self._loop or not self.session:
@@ -1120,6 +1160,7 @@ class JarvisLive:
             parts.append(ro_memory_context)
         parts.append(portuguese_default_instruction())
         parts.append(tool_truthfulness_instruction())
+        parts.append(addressing_gate_instruction())
         if _speech_control_enabled() and self._speech_control_state.concise_mode:
             parts.append("[SPEECH CONTROL]\nResponda de forma curta e direta.\n")
         parts.append(sys_prompt)
@@ -1143,6 +1184,16 @@ class JarvisLive:
     async def _execute_tool(self, fc) -> types.FunctionResponse:
         name = fc.name
         args = dict(fc.args or {})
+
+        if self._current_audio_turn_ignored:
+            return types.FunctionResponse(
+                id=fc.id,
+                name=name,
+                response={
+                    "result": "blocked_not_addressed",
+                    "reason": self._current_audio_turn_ignore_reason or "not_addressed",
+                },
+            )
 
         validation = validate_tool_call_against_user_text(name, args, self.last_user_text)
         if not validation.get("allow", True):
@@ -1475,10 +1526,13 @@ class JarvisLive:
     async def _receive_audio(self):
         print("[JARVIS] 👂 Recv started")
         out_buf, in_buf = [], []
+        current_audio_chunks: list[str] = []
 
         try:
             while True:
                 async for response in self.session.receive():
+                    turn_was_ignored = self._current_audio_turn_ignored
+                    turn_ignore_reason = self._current_audio_turn_ignore_reason
 
                     if response.data:
                         if self._suppress_audio_until_turn_complete:
@@ -1494,7 +1548,7 @@ class JarvisLive:
 
                         if sc.output_transcription and sc.output_transcription.text:
                             txt = _clean_transcript(sc.output_transcription.text)
-                            if txt:
+                            if txt and not self._current_audio_turn_ignored:
                                 out_buf.append(txt)
 
                         if sc.input_transcription and sc.input_transcription.text:
@@ -1502,28 +1556,72 @@ class JarvisLive:
                             if txt:
                                 if self._handle_speech_control_command(txt, source="audio"):
                                     speech_control_handled = True
+                                    self._current_audio_turn_ignored = True
+                                    self._current_audio_turn_ignore_reason = "speech_control"
+                                    self._suppress_audio_until_turn_complete = True
                                     in_buf = []
-                                elif not speech_control_handled:
-                                    in_buf.append(txt)
+                                    current_audio_chunks = []
+                                else:
+                                    current_audio_chunks.append(txt)
+                                    combined = " ".join(current_audio_chunks).strip()
+                                    allowed, stripped = self._apply_addressing_gate(combined, source="audio")
+                                    if allowed:
+                                        in_buf = [stripped] if stripped else []
+                                    else:
+                                        in_buf = []
+
+                        turn_was_ignored = self._current_audio_turn_ignored
+                        turn_ignore_reason = self._current_audio_turn_ignore_reason
 
                         if sc.turn_complete:
                             if self._turn_done_event:
                                 self._turn_done_event.set()
                             self._suppress_audio_until_turn_complete = False
 
+                            if turn_was_ignored and turn_ignore_reason == "not_addressed":
+                                raw_ignored = " ".join(current_audio_chunks).strip()
+                                if raw_ignored:
+                                    record_event(
+                                        "user_utterance_ignored_not_addressed",
+                                        "AddressingGate",
+                                        raw_ignored[:200],
+                                        metadata={
+                                            "source": "audio",
+                                            "reason": turn_ignore_reason,
+                                        },
+                                    )
+
                             full_in = " ".join(in_buf).strip()
-                            if full_in:
+                            if full_in and not self._current_audio_turn_ignored:
                                 record_event("user_input", "audio_transcription", full_in[:200], metadata={"input_type": "audio"})
                                 self._safe_write_log(f"You: {full_in}")
                                 self.last_user_text = full_in
                             in_buf = []
 
                             full_out = " ".join(out_buf).strip()
-                            if full_out:
+                            if full_out and not self._current_audio_turn_ignored:
                                 self._safe_write_log(f"Jarvis: {full_out}")
                             out_buf = []
+                            current_audio_chunks = []
+                            self._current_audio_turn_ignored = False
+                            self._current_audio_turn_ignore_reason = None
 
                     if response.tool_call:
+                        if turn_was_ignored:
+                            fn_responses = []
+                            for fc in response.tool_call.function_calls:
+                                fn_responses.append(
+                                    types.FunctionResponse(
+                                        id=fc.id,
+                                        name=fc.name,
+                                        response={
+                                            "result": "blocked_not_addressed",
+                                            "reason": turn_ignore_reason or "not_addressed",
+                                        },
+                                    )
+                                )
+                            await self.session.send_tool_response(function_responses=fn_responses)
+                            continue
                         fn_responses = []
                         for fc in response.tool_call.function_calls:
                             print(f"[JARVIS] 📞 {fc.name}")

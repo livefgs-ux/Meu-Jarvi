@@ -83,6 +83,14 @@ def tool_truthfulness_instruction() -> str:
     )
 
 
+def addressing_gate_instruction() -> str:
+    return (
+        "Quando o microfone estiver ativo, responda somente se o usuário chamar Jarvis, Charles, Meu Jarvis, assistente ou uma wake word equivalente. "
+        "Conversas paralelas devem ser ignoradas. "
+        "Se a chamada estiver ausente, não responda nem execute ferramentas."
+    )
+
+
 def concise_clarification(message: str) -> str:
     norm = _normalize(message)
     if not norm:
