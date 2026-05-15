@@ -266,7 +266,12 @@ def open_app(
 
     # Use Trusted App Resolver
     start_time = time.time()
-    trusted_res = resolve_trusted_app(app_name)
+    trusted_res = resolve_trusted_app(
+        app_name,
+        include_alternatives=bool((parameters or {}).get("show_alternatives")),
+    )
+    if (parameters or {}).get("show_alternatives"):
+        trusted_res["show_alternatives"] = True
     duration_ms = (time.time() - start_time) * 1000
     status = trusted_res["status"]
 

@@ -370,7 +370,11 @@ def find_app_candidates(query: str, inventory: Optional[AppInventory] = None) ->
 
     return matches
 
-def resolve_trusted_app(query: str, inventory: Optional[AppInventory] = None) -> Dict:
+def resolve_trusted_app(
+    query: str,
+    inventory: Optional[AppInventory] = None,
+    include_alternatives: bool = False,
+) -> Dict:
     if inventory is None:
         inventory = get_cached_or_build_inventory(light_scan=False)
 
@@ -378,13 +382,14 @@ def resolve_trusted_app(query: str, inventory: Optional[AppInventory] = None) ->
     norm_query = normalize_app_query(query)
 
     if not candidates:
-        alternatives = find_alternative_apps(query, inventory)
-        return {
+        result = {
             "status": "not_found",
             "query": query,
             "candidate": None,
-            "alternatives": alternatives
         }
+        if include_alternatives:
+            result["alternatives"] = find_alternative_apps(query, inventory)
+        return result
 
     # Filter out forbidden overlaps explicitly again
     trusted = []
@@ -482,29 +487,31 @@ def get_cached_or_build_inventory(light_scan=True, force_refresh=False, cache_pa
 def format_app_resolution_message(query: str, resolution: Dict) -> str:
     status = resolution.get("status")
     name = resolution.get("candidate").name if resolution.get("candidate") else query
+    allow_alternatives = bool(resolution.get("show_alternatives") or resolution.get("include_alternatives"))
 
     if status == "not_found":
-        msg = f"{query} não está instalado ou não foi encontrado neste PC."
-        alternatives = resolution.get("alternatives", [])
-        if alternatives:
-            msg += f" Encontrei alternativas: {', '.join(alternatives)}."
-
-        # Special case for IE
-        if normalize_app_query(query) == "internet explorer":
-            msg += " Você pode tentar usar o Microsoft Edge no modo IE."
-
-        return msg
+        if allow_alternatives:
+            alternatives = resolution.get("alternatives", [])
+            if alternatives:
+                return (
+                    f"{query} não parece estar instalado neste PC. "
+                    f"Posso te ajudar a instalar? Se você quiser uma alternativa, encontrei: {', '.join(alternatives)}."
+                )
+        return f"{query} não parece estar instalado neste PC. Posso te ajudar a instalar?"
 
     if status == "stale":
-        return f"Encontrei registros antigos ou atalhos quebrados para {name}, mas nenhum executável válido."
+        return (
+            f"Encontrei sinais antigos de {name}, mas o executável não existe mais. "
+            f"Parece desinstalado ou quebrado. Posso te ajudar a reinstalar?"
+        )
 
     if status == "ambiguous":
         candidates = resolution.get("candidates", [])
         names = ", ".join([c.name for c in candidates[:3]])
-        return f"Encontrei mais de um aplicativo parecido: {names}. Qual deles você quer abrir?"
+        return f"Encontrei mais de uma instalação possível de {name}: {names}. Qual delas você quer abrir?"
 
     if status == "registry_only":
-        return f"Encontrei uma entrada de {name} no Registro do Windows, mas não consegui verificar o executável. Não vou abrir automaticamente."
+        return f"Encontrei uma entrada de {name}, mas não consegui confirmar o executável. Posso verificar a instalação?"
 
     return f"Resultado inesperado para {query} (Status: {status})."
 

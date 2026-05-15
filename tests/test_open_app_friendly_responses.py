@@ -20,50 +20,51 @@ class TestOpenAppFriendlyResponses(unittest.TestCase):
         self.patcher.stop()
 
     @patch("actions.open_app.resolve_trusted_app")
-    def test_vscode_not_found_message_is_user_friendly(self, mock_resolve):
+    def test_vscode_not_found_does_not_suggest_cursor_by_default(self, mock_resolve):
         mock_resolve.return_value = {
-            "status": "not_found", 
-            "query": "VS Code", 
-            "alternatives": []
+            "status": "not_found",
+            "query": "VS Code",
         }
         result = open_app({"app_name": "VS Code"})
-        self.assertIn("não está instalado ou não foi encontrado neste PC", result)
-        self.assertNotIn("trusted app inventory", result)
+        self.assertNotIn("Cursor", result)
+        self.assertNotIn("Codex", result)
+        self.assertIn("não parece estar instalado neste PC", result)
 
     @patch("actions.open_app.resolve_trusted_app")
-    def test_vscode_not_found_lists_cursor_codex_as_alternatives(self, mock_resolve):
+    def test_vscode_not_found_offers_install_help(self, mock_resolve):
         mock_resolve.return_value = {
-            "status": "not_found", 
-            "query": "VS Code", 
-            "alternatives": ["Cursor", "Codex"]
+            "status": "not_found",
+            "query": "VS Code",
         }
         result = open_app({"app_name": "VS Code"})
-        self.assertIn("Encontrei alternativas: Cursor, Codex", result)
+        self.assertIn("Posso te ajudar a instalar?", result)
 
     @patch("actions.open_app.resolve_trusted_app")
-    def test_not_found_message_does_not_say_trusted_app_inventory_to_user(self, mock_resolve):
+    def test_alternatives_only_shown_when_user_asks_for_alternative(self, mock_resolve):
         mock_resolve.return_value = {
-            "status": "not_found", 
-            "query": "Some App", 
-            "alternatives": []
+            "status": "not_found",
+            "query": "VS Code",
+            "alternatives": ["Cursor", "Codex"],
         }
-        result = open_app({"app_name": "Some App"})
+        result = open_app({"app_name": "VS Code", "show_alternatives": True})
+        self.assertIn("Se você quiser uma alternativa, encontrei: Cursor, Codex", result)
         self.assertNotIn("trusted app inventory", result.lower())
 
     @patch("actions.open_app.resolve_trusted_app")
-    def test_stale_message_mentions_broken_entries(self, mock_resolve):
+    def test_stale_app_offers_reinstall_help(self, mock_resolve):
         mock_resolve.return_value = {
-            "status": "stale", 
+            "status": "stale",
             "query": "BrokenApp",
             "candidate": AppCandidate(name="BrokenApp", normalized_name="brokenapp")
         }
         result = open_app({"app_name": "BrokenApp"})
-        self.assertIn("registros antigos ou atalhos quebrados", result)
+        self.assertIn("Posso te ajudar a reinstalar?", result)
+        self.assertIn("sinais antigos de BrokenApp", result)
 
     @patch("actions.open_app.resolve_trusted_app")
-    def test_ambiguous_message_lists_candidates(self, mock_resolve):
+    def test_ambiguous_same_app_can_ask_which_installation(self, mock_resolve):
         mock_resolve.return_value = {
-            "status": "ambiguous", 
+            "status": "ambiguous",
             "query": "App",
             "candidates": [
                 AppCandidate(name="App One", normalized_name="app one"),
@@ -71,28 +72,30 @@ class TestOpenAppFriendlyResponses(unittest.TestCase):
             ]
         }
         result = open_app({"app_name": "App"})
-        self.assertIn("Encontrei mais de um aplicativo parecido: App One, App Two", result)
+        self.assertIn("Encontrei mais de uma instalação possível de App", result)
+        self.assertIn("Qual delas você quer abrir?", result)
 
     @patch("actions.open_app.resolve_trusted_app")
     def test_registry_only_message_does_not_open(self, mock_resolve):
         mock_resolve.return_value = {
-            "status": "registry_only", 
+            "status": "registry_only",
             "query": "RegOnly",
             "candidate": AppCandidate(name="RegOnly", normalized_name="regonly")
         }
         result = open_app({"app_name": "RegOnly"})
-        self.assertIn("não consegui verificar o executável", result)
+        self.assertIn("não consegui confirmar o executável", result)
         self.mock_launcher.assert_not_called()
 
     @patch("actions.open_app.resolve_trusted_app")
-    def test_internet_explorer_not_found_suggests_edge_ie_mode(self, mock_resolve):
+    def test_different_app_is_not_treated_as_alternative_for_open_request(self, mock_resolve):
         mock_resolve.return_value = {
-            "status": "not_found", 
-            "query": "Internet Explorer", 
-            "alternatives": ["Microsoft Edge"]
+            "status": "not_found",
+            "query": "VS Code",
+            "alternatives": ["Cursor", "Codex"],
         }
-        result = open_app({"app_name": "Internet Explorer"})
-        self.assertIn("Microsoft Edge no modo IE", result)
+        result = open_app({"app_name": "VS Code"})
+        self.assertNotIn("Cursor", result)
+        self.assertNotIn("Codex", result)
 
     def test_no_real_apps_launched(self):
         # Guaranteed by setUp mocking _OS_LAUNCHERS
