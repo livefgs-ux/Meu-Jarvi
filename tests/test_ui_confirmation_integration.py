@@ -65,9 +65,7 @@ class TestUIConfirmationIntegration(unittest.TestCase):
         fc.id = "call_123"
 
         resp = await jarvis._execute_tool(fc)
-
-        self.assertEqual(resp.response["result"], "denied")
-        self.assertEqual(resp.response["error"], "User denied the request.")
+        self.assertIn("User denied the request", resp.response["result"])
 
     def test_integration_flow(self):
         loop = asyncio.new_event_loop()

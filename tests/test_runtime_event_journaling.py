@@ -82,7 +82,13 @@ class TestRuntimeEventJournaling(unittest.TestCase):
         self.assertEqual(events[0].summary, "Search result")
 
     def test_tool_result_records_event(self):
-        asyncio.run(self.async_test_tool_result_records_event())
+        try:
+            asyncio.run(self.async_test_tool_result_records_event())
+        except AssertionError:
+            events = self.timeline.list_recent(20)
+            for e in events:
+                print(f"EVENT: {e.event_type} - {e.summary}")
+            raise
 
     async def async_test_tool_error_records_event(self):
         fc = MagicMock()

@@ -1,8 +1,10 @@
 import asyncio
+import time
 import os
 import re
 import threading
 import json
+import uuid
 import sys
 import traceback
 from pathlib import Path
@@ -16,6 +18,7 @@ from memory.memory_manager import (
 )
 from memory_engine.runtime_context import build_readonly_memory_context_from_env
 from core.runtime_journal import record_event
+from core.task_runtime import get_task_runtime, TaskPriority
 
 from actions.file_processor import file_processor
 from actions.flight_finder     import flight_finder
@@ -348,6 +351,53 @@ def _apply_tool_call_gate(name: str, args: dict, user_text: str | None = None) -
     if cl["action"] == "confirm": return False, _format_tool_confirmation(name, args, cl), "confirm"
     if cl["action"] == "deny": return False, _format_tool_denial(name, args, cl), "deny"
     return True, None, "allow"
+
+
+def _concurrent_runtime_enabled() -> bool:
+    raw = os.environ.get("JARVIS_CONCURRENT_TASK_RUNTIME")
+    if raw is None:
+        return False
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _tool_resource_locks(name: str, args: dict) -> set[str]:
+    locks = set()
+    if name == "open_app":
+        locks.update(["active_window", f"app:{args.get('app_name')}"])
+    elif name == "web_search":
+        locks.update(["network", "low_risk_background"])
+    elif name == "browser_control":
+        locks.update(["browser", f"browser:{args.get('browser', 'default')}"])
+    elif name in ["computer_control", "computer_settings", "desktop_control"]:
+        locks.update(["keyboard", "mouse", "active_window"])
+    elif name == "file_controller":
+        locks.update(["filesystem", f"filesystem:{args.get('path', '')}"])
+    elif name in ["code_helper", "dev_agent", "file_processor"]:
+        locks.update(["filesystem", "low_risk_background"])
+    elif name == "game_updater":
+        locks.update(["network", "low_risk_background"])
+    return locks
+
+
+def _tool_can_run_background(name: str, args: dict) -> bool:
+    # Explicitly allowed tools for background execution
+    safe_tools = {
+        "open_app", "web_search", "browser_control",
+        "file_processor", "code_helper", "dev_agent", "game_updater"
+    }
+    return name in safe_tools
+
+
+def _format_task_started_message(name: str, task_id: str) -> str:
+    return f"Sir, I've started the {name} task in the background (ID: {task_id[:8]}). I'll let you know when it's done."
+
+
+def _format_task_completed_message(name: str, result: str) -> str:
+    return f"Sir, the {name} task is complete: {result}"
+
+
+def _format_task_failed_message(name: str, error: str) -> str:
+    return f"Sir, the {name} task failed: {error}"
 
 TOOL_DECLARATIONS = [
     {
@@ -861,40 +911,100 @@ class JarvisLive:
     async def _execute_tool(self, fc) -> types.FunctionResponse:
         name = fc.name
         args = dict(fc.args or {})
-        record_event("tool_called", name, f"Tool called: {name}", metadata=args, correlation_id=fc.id)
 
+        # Concurrent mode logic
+        if _concurrent_runtime_enabled() and _tool_can_run_background(name, args):
+            try:
+                runtime = get_task_runtime()
+                locks = _tool_resource_locks(name, args)
+
+                async def background_task_wrapper():
+                    # Journal start
+                    record_event("tool_called", name, f"Tool called (BG): {name}", metadata=args, correlation_id=fc.id)
+                    
+                    res = await self._call_tool_implementation(name, args, fc=fc)
+                    
+                    # Journal result
+                    self._journal_tool_result(name, res, fc)
+                    
+                    # Success/Failure speaking logic
+                    res_low = str(res).lower()
+                    if "failed" in res_low or "error" in res_low:
+                        self.speak(_format_task_failed_message(name, res))
+                    else:
+                        self.speak(_format_task_completed_message(name, res))
+                    return res
+
+                task_id = await runtime.submit(
+                    name=name,
+                    coro_func=background_task_wrapper,
+                    resource_locks=locks,
+                    correlation_id=fc.id,
+                    metadata=args
+                )
+
+                # Fast-path wait (e.g. 1.5s)
+                start_wait = time.time()
+                while time.time() - start_wait < 1.5:
+                    task = runtime.get_task(task_id)
+                    if task.status in ["completed", "failed"]:
+                        final_res = task.result if task.status == "completed" else task.error
+                        return types.FunctionResponse(
+                            id=fc.id, name=name,
+                            response={"result": final_res}
+                        )
+                    await asyncio.sleep(0.1)
+
+                # If still running, return task_started
+                msg = _format_task_started_message(name, task_id)
+                self.ui.write_log(f"SYS: Task {task_id[:8]} started in background.")
+                return types.FunctionResponse(
+                    id=fc.id, name=name,
+                    response={"result": msg, "task_id": task_id}
+                )
+            except Exception as e:
+                print(f"[Concurrent] Runtime error, falling back to sync: {e}")
+                record_event("task_runtime_error", name, str(e), metadata={"tool": name}, severity="error")
+
+        # Standard synchronous path
+        record_event("tool_called", name, f"Tool called: {name}", metadata=args, correlation_id=fc.id)
+        result = await self._call_tool_implementation(name, args, fc=fc)
+        self._journal_tool_result(name, result, fc)
+
+        return types.FunctionResponse(
+            id=fc.id, name=name,
+            response={"result": result}
+        )
+
+    def _journal_tool_result(self, name: str, result: str, fc):
+        print(f"[JARVIS]  {name} -> {str(result)[:80]}")
+        event_type = "tool_result"
+        res_low = str(result).lower()
+        if name == "open_app":
+            if any(w in res_low for w in ["not found", "não foi encontrado"]): event_type = "app_not_found"
+            elif any(w in res_low for w in ["stale", "broken"]): event_type = "app_stale"
+            elif any(w in res_low for w in ["ambiguous", "mais de um"]): event_type = "app_ambiguous"
+            elif any(w in res_low for w in ["mismatch", "verification failed"]): event_type = "app_mismatch"
+        
+        record_event(event_type, name, str(result)[:200], metadata={"tool": name}, correlation_id=fc.id)
+
+    async def _call_tool_implementation(self, name: str, args: dict, fc=None) -> str:
         # Phase 5C: Smart Tool Call Safety Gate
         allowed, msg, action = _apply_tool_call_gate(name, args, self.last_user_text)
         if not allowed:
             if action == "confirm":
-                # Phase 5E: Visual Confirmation
                 print(f"[GATE] Requesting confirmation for {name}...")
-                if msg:
-                    self.speak(msg)
-
-                # Await user decision from UI
+                if msg: self.speak(msg)
                 record_event("confirmation_required", name, msg[:200] if msg else f"Confirm tool {name}?", metadata={"tool": name}, correlation_id=fc.id)
                 approved = await self.ui.request_confirmation(msg or f"Confirm tool {name}?")
-
                 if approved:
-                    print(f"[GATE] Approved by user: {name}")
                     record_event("confirmation_approved", name, f"User approved {name}", metadata={"tool": name}, correlation_id=fc.id)
-                    # Allowed to proceed
                 else:
-                    print(f"[GATE] Denied by user: {name}")
                     record_event("confirmation_denied", name, f"User denied {name}", metadata={"tool": name}, correlation_id=fc.id)
-                    return types.FunctionResponse(
-                        id=fc.id, name=name,
-                        response={"result": "denied", "error": "User denied the request."}
-                    )
+                    return "User denied the request."
             else:
-                # Deny
-                if msg:
-                    self.speak(msg)
-                return types.FunctionResponse(
-                    id=fc.id, name=name,
-                    response={"result": "denied", "error": msg}
-                )
+                if msg: self.speak(msg)
+                return f"Denied: {msg}"
 
         print(f"[JARVIS] TOOL: {name} {args}")
         self.ui.set_state("THINKING")
@@ -904,20 +1014,9 @@ class JarvisLive:
             key      = args.get("key", "")
             value    = args.get("value", "")
             ok, err = _execute_save_memory(category, key, value)
-            if ok and (not err) and key and value:
-                print(f"[Memory]  save_memory: {category}/{key} = {value}")
-            if not self.ui.muted:
-                self.ui.set_state("LISTENING")
-            if err.startswith("skipped:"):
-                _save_res = "skipped"
-            elif ok:
-                _save_res = "ok"
-            else:
-                _save_res = "error"
-            return types.FunctionResponse(
-                id=fc.id, name=name,
-                response={"result": _save_res, "error": err, "silent": True}
-            )
+            if not self.ui.muted: self.ui.set_state("LISTENING")
+            if ok: return f"Memory saved: {category}/{key}"
+            return f"Failed to save memory: {err}"
 
         loop   = asyncio.get_event_loop()
         result = "Done."
@@ -1028,23 +1127,7 @@ class JarvisLive:
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
 
-        print(f"[JARVIS]  {name} -> {str(result)[:80]}")
-
-        # Classification for journaling
-        event_type = "tool_result"
-        res_low = str(result).lower()
-        if name == "open_app":
-            if any(w in res_low for w in ["not found", "não foi encontrado"]): event_type = "app_not_found"
-            elif any(w in res_low for w in ["stale", "broken"]): event_type = "app_stale"
-            elif any(w in res_low for w in ["ambiguous", "mais de um"]): event_type = "app_ambiguous"
-            elif any(w in res_low for w in ["mismatch", "verification failed"]): event_type = "app_mismatch"
-
-        record_event(event_type, name, str(result)[:200], metadata={"tool": name}, correlation_id=fc.id)
-
-        return types.FunctionResponse(
-            id=fc.id, name=name,
-            response={"result": result}
-        )
+        return result
 
     async def _send_realtime(self):
         while True:
