@@ -79,6 +79,22 @@ class TestAddressingGateIntegration(unittest.IsolatedAsyncioTestCase):
         with patch("builtins.print"), self.assertRaises(RuntimeError):
             await jarvis._receive_audio()
 
+    async def _receive_three(self, jarvis, response_one, response_two, response_three):
+        async def one_response():
+            yield response_one
+
+        async def two_response():
+            yield response_two
+
+        async def three_response():
+            yield response_three
+
+        jarvis.session.receive = MagicMock(
+            side_effect=[one_response(), two_response(), three_response(), RuntimeError("end")]
+        )
+        with patch("builtins.print"), self.assertRaises(RuntimeError):
+            await jarvis._receive_audio()
+
     async def test_audio_without_wake_word_does_not_call_model_or_tool(self):
         jarvis = self._make_jarvis()
         response = self._make_response("abre o VS Code", tool_name="open_app", tool_args={"app_name": "VS Code"})
@@ -94,21 +110,22 @@ class TestAddressingGateIntegration(unittest.IsolatedAsyncioTestCase):
     async def test_audio_wake_word_only_does_not_call_tool(self):
         jarvis = self._make_jarvis()
         response = self._make_response("Jarvis")
-        with patch("main.open_app") as open_app:
-            await self._receive_once(jarvis, response)
+        jarvis._execute_tool = AsyncMock(return_value=types.SimpleNamespace(response={"result": "ok"}))
+        await self._receive_once(jarvis, response)
 
-        open_app.assert_not_called()
+        jarvis._execute_tool.assert_not_called()
         self.assertTrue(jarvis.speak.called)
         self.assertEqual(jarvis.speak.call_args.args[0], "Sim?")
 
     async def test_audio_wake_word_only_speaks_short_ack(self):
         jarvis = self._make_jarvis()
         response = self._make_response("Jarvis")
-
+        jarvis._execute_tool = AsyncMock(return_value=types.SimpleNamespace(response={"result": "ok"}))
         await self._receive_once(jarvis, response)
 
         self.assertTrue(jarvis.speak.called)
         self.assertEqual(jarvis.speak.call_args.args[0], "Sim?")
+        jarvis._execute_tool.assert_not_called()
 
     async def test_audio_followup_after_wake_word_calls_existing_flow(self):
         jarvis = self._make_jarvis()
@@ -120,6 +137,7 @@ class TestAddressingGateIntegration(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(jarvis.last_user_text, "abre o VS Code")
         jarvis._execute_tool.assert_called_once()
+        self.assertEqual(jarvis._execute_tool.call_args.args[0].name, "open_app")
 
     async def test_audio_followup_after_wake_word_strips_nothing_extra(self):
         jarvis = self._make_jarvis()
@@ -138,6 +156,28 @@ class TestAddressingGateIntegration(unittest.IsolatedAsyncioTestCase):
 
         jarvis._execute_tool.assert_not_called()
         self.assertIsNone(jarvis.last_user_text)
+
+    async def test_jarvis_then_online_does_not_call_model(self):
+        jarvis = self._make_jarvis()
+        response_one = self._make_response("Jarvis")
+        response_two = self._make_response("online")
+        jarvis._execute_tool = AsyncMock(return_value=types.SimpleNamespace(response={"result": "ok"}))
+        await self._receive_two(jarvis, response_one, response_two)
+
+        jarvis._execute_tool.assert_not_called()
+        self.assertTrue(jarvis.speak.called)
+
+    async def test_jarvis_then_noise_then_open_cursor_still_works(self):
+        jarvis = self._make_jarvis()
+        response_one = self._make_response("Jarvis")
+        response_two = self._make_response("online")
+        response_three = self._make_response("abre o Cursor", tool_name="open_app", tool_args={"app_name": "Cursor"})
+        jarvis._execute_tool = AsyncMock(return_value=types.SimpleNamespace(response={"result": "ok"}))
+        await self._receive_three(jarvis, response_one, response_two, response_three)
+
+        jarvis._execute_tool.assert_called_once()
+        self.assertEqual(jarvis._execute_tool.call_args.args[0].name, "open_app")
+        self.assertEqual(jarvis.last_user_text, "abre o Cursor")
 
     async def test_open_app_after_wake_word_then_command_is_called(self):
         jarvis = self._make_jarvis()

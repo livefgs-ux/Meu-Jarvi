@@ -2,9 +2,13 @@ import unittest
 from unittest.mock import patch
 
 from core.voice_activation_state import (
+    append_followup_fragment,
     arm_voice_activation,
     clear_voice_activation,
+    clear_followup_buffer,
     consume_voice_activation,
+    flush_followup_buffer_if_ready,
+    get_followup_buffer,
     get_voice_activation_state,
     is_voice_activation_active,
 )
@@ -13,9 +17,11 @@ from core.voice_activation_state import (
 class TestVoiceActivationState(unittest.TestCase):
     def setUp(self):
         clear_voice_activation()
+        clear_followup_buffer()
 
     def tearDown(self):
         clear_voice_activation()
+        clear_followup_buffer()
 
     def test_wake_word_only_arms_window(self):
         with patch("core.voice_activation_state.time.time", return_value=100.0):
@@ -60,6 +66,24 @@ class TestVoiceActivationState(unittest.TestCase):
         self.assertGreater(second.armed_until, first.armed_until)
         self.assertEqual(second.matched_wake_word, "charles")
         self.assertEqual(get_voice_activation_state().last_activation_text, "Charles")
+
+    def test_append_followup_fragment_buffers_text(self):
+        append_followup_fragment("abre")
+        self.assertEqual(get_followup_buffer(), ("abre",))
+
+    def test_flush_followup_buffer_if_ready_returns_text_after_timeout(self):
+        with patch("core.voice_activation_state.time.time", return_value=100.0):
+            append_followup_fragment("abre")
+        with patch("core.voice_activation_state.time.time", return_value=100.5):
+            append_followup_fragment("o Cursor")
+        flushed = flush_followup_buffer_if_ready(now=102.0)
+        self.assertEqual(flushed, "abre o Cursor")
+        self.assertEqual(get_followup_buffer(), ())
+
+    def test_clear_followup_buffer_resets_buffer(self):
+        append_followup_fragment("abre")
+        clear_followup_buffer()
+        self.assertEqual(get_followup_buffer(), ())
 
 
 if __name__ == "__main__":

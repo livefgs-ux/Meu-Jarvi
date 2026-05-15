@@ -30,8 +30,16 @@ from core.response_discipline import (
     portuguese_default_instruction,
     tool_truthfulness_instruction,
 )
-from core.addressing_gate import should_process_audio_utterance, should_process_user_utterance
-from core.voice_activation_state import arm_voice_activation, clear_voice_activation, consume_voice_activation
+from core.addressing_gate import is_meaningful_followup, should_process_audio_utterance, should_process_user_utterance
+from core.voice_activation_state import (
+    append_followup_fragment,
+    arm_voice_activation,
+    clear_followup_buffer,
+    clear_voice_activation,
+    consume_voice_activation,
+    flush_followup_buffer_if_ready,
+    get_followup_buffer,
+)
 from core.speech_control import (
     SpeechCommandType,
     SpeechControlState,
@@ -944,6 +952,7 @@ class JarvisLive:
             return True
 
         if command_type == SpeechCommandType.TEMPORARY_SILENCE.value:
+            clear_followup_buffer()
             self._speech_control_state.is_silenced = True
             self._speech_control_state.interrupted_at = now
             self._speech_control_state.silence_until = None
@@ -952,6 +961,7 @@ class JarvisLive:
             return True
 
         if command_type == SpeechCommandType.RESUME_SPEECH.value:
+            clear_followup_buffer()
             self._speech_control_state.is_silenced = False
             self._speech_control_state.silence_until = None
             self._suppress_audio_until_turn_complete = False
@@ -960,16 +970,19 @@ class JarvisLive:
             return True
 
         if command_type == SpeechCommandType.CONCISE_MODE.value:
+            clear_followup_buffer()
             self._speech_control_state.concise_mode = True
             record_event("concise_mode_enabled", "SpeechControl", "Concise mode enabled", metadata={"source": source})
             return True
 
         if command_type == SpeechCommandType.NORMAL_MODE.value:
+            clear_followup_buffer()
             self._speech_control_state.concise_mode = False
             record_event("concise_mode_disabled", "SpeechControl", "Concise mode disabled", metadata={"source": source})
             return True
 
         if command_type == SpeechCommandType.CANCEL_TASK.value:
+            clear_followup_buffer()
             record_event("task_cancel_requested", "SpeechControl", "Task cancellation requested", metadata={"source": source})
             self._safe_write_log("SYS: Task cancellation command received.")
             return True
@@ -1025,6 +1038,7 @@ class JarvisLive:
                 severity="error",
             )
             if mic_mode:
+                clear_followup_buffer()
                 self._current_audio_turn_ignored = True
                 self._current_audio_turn_ignore_reason = "gate_error"
                 self._suppress_audio_until_turn_complete = True
@@ -1553,12 +1567,23 @@ class JarvisLive:
                                     self._current_audio_turn_ignore_reason = "speech_control"
                                     self._current_audio_turn_wake_word_only = False
                                     self._suppress_audio_until_turn_complete = True
+                                    clear_followup_buffer()
                                     in_buf = []
                                     current_audio_chunks = []
                                 else:
                                     current_audio_chunks.append(txt)
-                                    combined = " ".join(current_audio_chunks).strip()
-                                    decision = self._apply_addressing_gate(combined, source="audio")
+                                    expired_buffer = flush_followup_buffer_if_ready()
+                                    if expired_buffer:
+                                        print("[AddressingGate] follow-up buffer expired")
+                                        record_event(
+                                            "voice_activation_expired",
+                                            "AddressingGate",
+                                            expired_buffer[:200],
+                                            metadata={"source": "audio", "reason": "buffer_timeout"},
+                                        )
+                                    buffered = " ".join(get_followup_buffer()).strip()
+                                    candidate = " ".join(part for part in [buffered, txt] if part).strip()
+                                    decision = self._apply_addressing_gate(candidate if buffered else txt, source="audio")
 
                                     if decision is None:
                                         in_buf = []
@@ -1569,7 +1594,7 @@ class JarvisLive:
                                         record_event(
                                             "voice_activation_armed",
                                             "AddressingGate",
-                                            combined[:200],
+                                            txt[:200],
                                             metadata={
                                                 "source": "audio",
                                                 "wake_word": wake_word,
@@ -1580,15 +1605,19 @@ class JarvisLive:
                                         self._current_audio_turn_ignore_reason = None
                                         self._current_audio_turn_wake_word_only = True
                                         self._suppress_audio_until_turn_complete = True
+                                        clear_followup_buffer()
                                         in_buf = []
                                         current_audio_chunks = []
                                         self.speak("Sim?")
                                     elif decision.reason == "armed_followup":
-                                        print("[AddressingGate] armed follow-up accepted")
+                                        if buffered:
+                                            print(f"[AddressingGate] buffered command accepted: '{decision.stripped_text}'")
+                                        else:
+                                            print("[AddressingGate] armed follow-up accepted")
                                         record_event(
                                             "voice_activation_consumed",
                                             "AddressingGate",
-                                            combined[:200],
+                                            decision.stripped_text[:200],
                                             metadata={
                                                 "source": "audio",
                                                 "wake_word": decision.matched_wake_word,
@@ -1597,33 +1626,69 @@ class JarvisLive:
                                         self._current_audio_turn_ignored = False
                                         self._current_audio_turn_ignore_reason = None
                                         self._current_audio_turn_wake_word_only = False
+                                        clear_followup_buffer()
                                         in_buf = [decision.stripped_text] if decision.stripped_text else []
+                                        current_audio_chunks = [decision.stripped_text] if decision.stripped_text else []
                                     elif decision.reason == "wake_word_matched":
                                         wake_word = (decision.matched_wake_word or "wake word").strip()
                                         print(f"[AddressingGate] wake word detected: {wake_word}")
                                         self._current_audio_turn_ignored = False
                                         self._current_audio_turn_ignore_reason = None
                                         self._current_audio_turn_wake_word_only = False
+                                        clear_followup_buffer()
                                         in_buf = [decision.stripped_text] if decision.stripped_text else []
+                                        current_audio_chunks = [decision.stripped_text] if decision.stripped_text else []
                                     elif decision.reason == "armed_expired":
                                         print("[AddressingGate] armed activation expired")
                                         record_event(
                                             "voice_activation_expired",
                                             "AddressingGate",
-                                            combined[:200],
+                                            candidate[:200],
                                             metadata={"source": "audio"},
                                         )
                                         self._current_audio_turn_ignored = True
                                         self._current_audio_turn_ignore_reason = "armed_expired"
                                         self._current_audio_turn_wake_word_only = False
                                         self._suppress_audio_until_turn_complete = True
+                                        clear_followup_buffer()
                                         in_buf = []
+                                        current_audio_chunks = []
+                                    elif decision.reason == "armed_fragment":
+                                        print("[AddressingGate] follow-up buffered")
+                                        record_event(
+                                            "voice_activation_buffered",
+                                            "AddressingGate",
+                                            candidate[:200],
+                                            metadata={"source": "audio", "fragment": txt},
+                                        )
+                                        append_followup_fragment(txt)
+                                        self._current_audio_turn_ignored = True
+                                        self._current_audio_turn_ignore_reason = "armed_fragment"
+                                        self._current_audio_turn_wake_word_only = False
+                                        self._suppress_audio_until_turn_complete = True
+                                        in_buf = []
+                                        current_audio_chunks = []
+                                    elif decision.reason == "armed_non_meaningful":
+                                        print("[AddressingGate] follow-up ignored: non meaningful")
+                                        record_event(
+                                            "ignored_non_meaningful_followup",
+                                            "AddressingGate",
+                                            candidate[:200],
+                                            metadata={"source": "audio", "fragment": txt},
+                                        )
+                                        self._current_audio_turn_ignored = True
+                                        self._current_audio_turn_ignore_reason = "armed_non_meaningful"
+                                        self._current_audio_turn_wake_word_only = False
+                                        self._suppress_audio_until_turn_complete = True
+                                        in_buf = []
+                                        current_audio_chunks = []
                                     else:
                                         print("[AddressingGate] ignored: not addressed")
                                         self._current_audio_turn_ignored = True
                                         self._current_audio_turn_ignore_reason = decision.reason or "not_addressed"
                                         self._current_audio_turn_wake_word_only = False
                                         self._suppress_audio_until_turn_complete = True
+                                        clear_followup_buffer()
                                         in_buf = []
 
                         if sc.turn_complete:

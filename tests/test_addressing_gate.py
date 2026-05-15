@@ -4,14 +4,19 @@ from unittest.mock import patch
 from core.addressing_gate import (
     GateDecision,
     is_addressed_to_jarvis,
+    is_meaningful_followup,
     normalize_address_text,
     should_process_audio_utterance,
     should_process_user_utterance,
     strip_wake_word,
 )
 from core.voice_activation_state import (
+    append_followup_fragment,
     arm_voice_activation,
+    clear_followup_buffer,
     clear_voice_activation,
+    flush_followup_buffer_if_ready,
+    get_followup_buffer,
     get_voice_activation_state,
 )
 
@@ -19,6 +24,7 @@ from core.voice_activation_state import (
 class TestAddressingGate(unittest.TestCase):
     def setUp(self):
         clear_voice_activation()
+        clear_followup_buffer()
 
     def test_jarvis_prefix_allows(self):
         decision = should_process_user_utterance("Jarvis, abre o VS Code")
@@ -70,6 +76,57 @@ class TestAddressingGate(unittest.TestCase):
         decision = should_process_user_utterance("")
         self.assertFalse(decision.allowed)
         self.assertEqual(decision.reason, "empty_text")
+
+    def test_wake_word_only_does_not_call_model(self):
+        decision = should_process_audio_utterance("Jarvis")
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.reason, "wake_word_only")
+        self.assertEqual(decision.stripped_text, "")
+
+    def test_online_after_wake_does_not_consume_window(self):
+        arm_voice_activation("jarvis", timeout_seconds=10.0, activation_text="Jarvis")
+        decision = should_process_audio_utterance("online")
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason, "armed_non_meaningful")
+        self.assertTrue(get_voice_activation_state().armed_until > 0)
+
+    def test_noise_after_wake_does_not_consume_window(self):
+        arm_voice_activation("jarvis", timeout_seconds=10.0, activation_text="Jarvis")
+        decision = should_process_audio_utterance("sim")
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason, "armed_non_meaningful")
+        self.assertTrue(get_voice_activation_state().armed_until > 0)
+
+    def test_meaningful_followup_consumes_window(self):
+        arm_voice_activation("jarvis", timeout_seconds=10.0, activation_text="Jarvis")
+        self.assertTrue(is_meaningful_followup("pesquisa novidades sobre IA"))
+        decision = should_process_audio_utterance("pesquisa novidades sobre IA")
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.reason, "armed_followup")
+        self.assertFalse(get_voice_activation_state().armed_until > 0)
+
+    def test_short_command_open_app_after_wake_is_accepted(self):
+        arm_voice_activation("jarvis", timeout_seconds=10.0, activation_text="Jarvis")
+        decision = should_process_audio_utterance("abre o Cursor")
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.reason, "armed_followup")
+        self.assertEqual(decision.stripped_text, "abre o Cursor")
+
+    def test_fragmented_followup_can_be_buffered(self):
+        arm_voice_activation("jarvis", timeout_seconds=10.0, activation_text="Jarvis")
+        decision = should_process_audio_utterance("abre")
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason, "armed_fragment")
+        append_followup_fragment("abre")
+        self.assertEqual(get_followup_buffer(), ("abre",))
+
+    def test_buffer_expires_without_calling_model(self):
+        with patch("core.voice_activation_state.time.time", return_value=100.0):
+            append_followup_fragment("abre")
+        with patch("core.addressing_gate.time.time", return_value=102.0):
+            expired = flush_followup_buffer_if_ready(now=102.0)
+        self.assertEqual(expired, "abre")
+        self.assertEqual(get_followup_buffer(), ())
 
     def test_wake_word_only_arms_window(self):
         decision = should_process_audio_utterance("Jarvis")

@@ -10,9 +10,12 @@ from typing import Iterable
 
 from core.voice_activation_state import (
     arm_voice_activation,
+    clear_followup_buffer,
     clear_voice_activation,
     consume_voice_activation,
+    flush_followup_buffer_if_ready,
     get_voice_activation_state,
+    get_followup_buffer,
 )
 
 _SPACE_RE = re.compile(r"\s+")
@@ -28,7 +31,51 @@ DEFAULT_WAKE_WORDS = (
     "assistente",
 )
 
-_LEADING_FILLERS = {"oi", "ola", "olá", "hey", "ei", "ok", "okay", "por favor", "pf"}
+_LEADING_FILLERS = {"oi", "ola", "hey", "ei", "ok", "okay", "por favor", "pf"}
+_NOISE_SINGLETONS = {
+    "online",
+    "sim",
+    "ok",
+    "ah",
+    "hum",
+    "ta",
+    "ne",
+    "certo",
+    "beleza",
+    "oi",
+    "estou",
+    "esta",
+    "to",
+    "sou",
+    "sao",
+}
+_MEANINGFUL_SINGLE_TOKEN_COMMANDS = {"para", "stop", "cancela", "cancel", "pare"}
+_MEANINGFUL_COMMAND_STARTS = {
+    "abre",
+    "abrir",
+    "pesquisa",
+    "pesquisar",
+    "mostra",
+    "mostrar",
+    "fecha",
+    "fechar",
+    "cancela",
+    "cancelar",
+    "procura",
+    "buscar",
+}
+_QUESTION_WORDS = {
+    "quem",
+    "qual",
+    "quais",
+    "quanto",
+    "quantos",
+    "quando",
+    "onde",
+    "como",
+    "porque",
+    "por",
+}
 
 
 @dataclass(frozen=True)
@@ -102,6 +149,60 @@ def strip_wake_word(text: str, wake_words: list[str] | None = None) -> str:
     return " ".join(stripped_tokens).strip()
 
 
+def is_meaningful_followup(text: str) -> bool:
+    raw = normalize_address_text(text)
+    if not raw:
+        return False
+
+    tokens = raw.split()
+    if not tokens:
+        return False
+
+    if len(tokens) == 1:
+        return tokens[0] in _MEANINGFUL_SINGLE_TOKEN_COMMANDS
+
+    if tokens[0] in _MEANINGFUL_COMMAND_STARTS:
+        return True
+
+    if any(token in _QUESTION_WORDS for token in tokens):
+        return True
+
+    if "?" in (text or "") and len(tokens) >= 2:
+        return True
+
+    return False
+
+
+def _is_noise_followup(text: str) -> bool:
+    raw = normalize_address_text(text)
+    if not raw:
+        return True
+
+    tokens = raw.split()
+    if not tokens:
+        return True
+
+    return all(token in _NOISE_SINGLETONS for token in tokens)
+
+
+def _is_bufferable_fragment(text: str) -> bool:
+    raw = normalize_address_text(text)
+    if not raw:
+        return False
+
+    tokens = raw.split()
+    if not tokens:
+        return False
+
+    if is_meaningful_followup(raw):
+        return False
+
+    if _is_noise_followup(raw):
+        return False
+
+    return len(tokens) <= 2
+
+
 def should_process_user_utterance(
     text: str,
     mic_mode: bool = True,
@@ -147,6 +248,7 @@ def should_process_audio_utterance(
     if matched:
         stripped = strip_wake_word(raw, wake_words=wake_words)
         clear_voice_activation()
+        clear_followup_buffer()
         if not stripped:
             arm_voice_activation(matched, timeout_seconds=timeout_seconds, activation_text=raw)
             return GateDecision(True, "wake_word_only", "", matched)
@@ -157,8 +259,20 @@ def should_process_audio_utterance(
         now = time.time()
         if state.armed_until <= now:
             clear_voice_activation()
+            clear_followup_buffer()
             return GateDecision(False, "armed_expired", "", state.matched_wake_word)
-        if consume_voice_activation():
-            return GateDecision(True, "armed_followup", raw, state.matched_wake_word)
+        buffered = " ".join(get_followup_buffer()).strip()
+        candidate = " ".join(part for part in [buffered, raw] if part).strip()
+        if candidate and is_meaningful_followup(candidate):
+            if consume_voice_activation():
+                clear_followup_buffer()
+                return GateDecision(True, "armed_followup", candidate, state.matched_wake_word)
+        if _is_bufferable_fragment(raw):
+            return GateDecision(False, "armed_fragment", raw, state.matched_wake_word)
+        if candidate and _is_bufferable_fragment(candidate):
+            return GateDecision(False, "armed_fragment", candidate, state.matched_wake_word)
+        if buffered:
+            flush_followup_buffer_if_ready(now=now)
+        return GateDecision(False, "armed_non_meaningful", "", state.matched_wake_word)
 
     return GateDecision(False, "not_addressed", "", None)
