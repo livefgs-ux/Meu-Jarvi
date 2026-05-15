@@ -30,7 +30,8 @@ from core.response_discipline import (
     portuguese_default_instruction,
     tool_truthfulness_instruction,
 )
-from core.addressing_gate import should_process_user_utterance, strip_wake_word
+from core.addressing_gate import should_process_audio_utterance, should_process_user_utterance
+from core.voice_activation_state import arm_voice_activation, clear_voice_activation, consume_voice_activation
 from core.speech_control import (
     SpeechCommandType,
     SpeechControlState,
@@ -862,6 +863,7 @@ class JarvisLive:
         self._suppress_audio_until_turn_complete = False
         self._current_audio_turn_ignored = False
         self._current_audio_turn_ignore_reason: str | None = None
+        self._current_audio_turn_wake_word_only = False
 
     def _safe_set_state(self, state: str):
         try:
@@ -1004,12 +1006,14 @@ class JarvisLive:
 
         return False
 
-    def _apply_addressing_gate(self, text: str, *, source: str = "audio") -> tuple[bool, str]:
+    def _apply_addressing_gate(self, text: str, *, source: str = "audio"):
         mic_mode = source == "audio"
         try:
-            decision = should_process_user_utterance(
+            if mic_mode:
+                return should_process_audio_utterance(text)
+            return should_process_user_utterance(
                 text,
-                mic_mode=mic_mode,
+                mic_mode=False,
                 text_input_always_allowed=True,
             )
         except Exception as exc:
@@ -1024,21 +1028,8 @@ class JarvisLive:
                 self._current_audio_turn_ignored = True
                 self._current_audio_turn_ignore_reason = "gate_error"
                 self._suppress_audio_until_turn_complete = True
-                return False, ""
-            return True, text
-
-        if decision.allowed:
-            if mic_mode:
-                self._current_audio_turn_ignored = False
-                self._current_audio_turn_ignore_reason = None
-            stripped = strip_wake_word(text) if mic_mode else (decision.stripped_text or text)
-            return True, stripped
-
-        if mic_mode:
-            self._current_audio_turn_ignored = True
-            self._current_audio_turn_ignore_reason = decision.reason
-            self._suppress_audio_until_turn_complete = True
-        return False, ""
+                return None
+            return None
 
     def _on_text_command(self, text: str):
         if not self._loop or not self.session:
@@ -1533,6 +1524,8 @@ class JarvisLive:
                 async for response in self.session.receive():
                     turn_was_ignored = self._current_audio_turn_ignored
                     turn_ignore_reason = self._current_audio_turn_ignore_reason
+                    turn_was_wake_word_only = self._current_audio_turn_wake_word_only
+                    turn_should_reset = False
 
                     if response.data:
                         if self._suppress_audio_until_turn_complete:
@@ -1548,7 +1541,7 @@ class JarvisLive:
 
                         if sc.output_transcription and sc.output_transcription.text:
                             txt = _clean_transcript(sc.output_transcription.text)
-                            if txt and not self._current_audio_turn_ignored:
+                            if txt and not self._current_audio_turn_ignored and not self._current_audio_turn_wake_word_only:
                                 out_buf.append(txt)
 
                         if sc.input_transcription and sc.input_transcription.text:
@@ -1558,25 +1551,90 @@ class JarvisLive:
                                     speech_control_handled = True
                                     self._current_audio_turn_ignored = True
                                     self._current_audio_turn_ignore_reason = "speech_control"
+                                    self._current_audio_turn_wake_word_only = False
                                     self._suppress_audio_until_turn_complete = True
                                     in_buf = []
                                     current_audio_chunks = []
                                 else:
                                     current_audio_chunks.append(txt)
                                     combined = " ".join(current_audio_chunks).strip()
-                                    allowed, stripped = self._apply_addressing_gate(combined, source="audio")
-                                    if allowed:
-                                        in_buf = [stripped] if stripped else []
-                                    else:
-                                        in_buf = []
+                                    decision = self._apply_addressing_gate(combined, source="audio")
 
-                        turn_was_ignored = self._current_audio_turn_ignored
-                        turn_ignore_reason = self._current_audio_turn_ignore_reason
+                                    if decision is None:
+                                        in_buf = []
+                                    elif decision.reason == "wake_word_only":
+                                        wake_word = (decision.matched_wake_word or "wake word").strip()
+                                        print(f"[AddressingGate] wake word detected: {wake_word}")
+                                        print("[AddressingGate] armed for 10s")
+                                        record_event(
+                                            "voice_activation_armed",
+                                            "AddressingGate",
+                                            combined[:200],
+                                            metadata={
+                                                "source": "audio",
+                                                "wake_word": wake_word,
+                                                "timeout_seconds": 10.0,
+                                            },
+                                        )
+                                        self._current_audio_turn_ignored = False
+                                        self._current_audio_turn_ignore_reason = None
+                                        self._current_audio_turn_wake_word_only = True
+                                        self._suppress_audio_until_turn_complete = True
+                                        in_buf = []
+                                        current_audio_chunks = []
+                                        self.speak("Sim?")
+                                    elif decision.reason == "armed_followup":
+                                        print("[AddressingGate] armed follow-up accepted")
+                                        record_event(
+                                            "voice_activation_consumed",
+                                            "AddressingGate",
+                                            combined[:200],
+                                            metadata={
+                                                "source": "audio",
+                                                "wake_word": decision.matched_wake_word,
+                                            },
+                                        )
+                                        self._current_audio_turn_ignored = False
+                                        self._current_audio_turn_ignore_reason = None
+                                        self._current_audio_turn_wake_word_only = False
+                                        in_buf = [decision.stripped_text] if decision.stripped_text else []
+                                    elif decision.reason == "wake_word_matched":
+                                        wake_word = (decision.matched_wake_word or "wake word").strip()
+                                        print(f"[AddressingGate] wake word detected: {wake_word}")
+                                        self._current_audio_turn_ignored = False
+                                        self._current_audio_turn_ignore_reason = None
+                                        self._current_audio_turn_wake_word_only = False
+                                        in_buf = [decision.stripped_text] if decision.stripped_text else []
+                                    elif decision.reason == "armed_expired":
+                                        print("[AddressingGate] armed activation expired")
+                                        record_event(
+                                            "voice_activation_expired",
+                                            "AddressingGate",
+                                            combined[:200],
+                                            metadata={"source": "audio"},
+                                        )
+                                        self._current_audio_turn_ignored = True
+                                        self._current_audio_turn_ignore_reason = "armed_expired"
+                                        self._current_audio_turn_wake_word_only = False
+                                        self._suppress_audio_until_turn_complete = True
+                                        in_buf = []
+                                    else:
+                                        print("[AddressingGate] ignored: not addressed")
+                                        self._current_audio_turn_ignored = True
+                                        self._current_audio_turn_ignore_reason = decision.reason or "not_addressed"
+                                        self._current_audio_turn_wake_word_only = False
+                                        self._suppress_audio_until_turn_complete = True
+                                        in_buf = []
 
                         if sc.turn_complete:
                             if self._turn_done_event:
                                 self._turn_done_event.set()
                             self._suppress_audio_until_turn_complete = False
+
+                            turn_should_reset = True
+
+                            turn_was_ignored = self._current_audio_turn_ignored
+                            turn_ignore_reason = self._current_audio_turn_ignore_reason
 
                             if turn_was_ignored and turn_ignore_reason == "not_addressed":
                                 raw_ignored = " ".join(current_audio_chunks).strip()
@@ -1602,12 +1660,9 @@ class JarvisLive:
                             if full_out and not self._current_audio_turn_ignored:
                                 self._safe_write_log(f"Jarvis: {full_out}")
                             out_buf = []
-                            current_audio_chunks = []
-                            self._current_audio_turn_ignored = False
-                            self._current_audio_turn_ignore_reason = None
 
                     if response.tool_call:
-                        if turn_was_ignored:
+                        if self._current_audio_turn_ignored or self._current_audio_turn_wake_word_only or turn_was_ignored or turn_was_wake_word_only:
                             fn_responses = []
                             for fc in response.tool_call.function_calls:
                                 fn_responses.append(
@@ -1621,15 +1676,21 @@ class JarvisLive:
                                     )
                                 )
                             await self.session.send_tool_response(function_responses=fn_responses)
-                            continue
-                        fn_responses = []
-                        for fc in response.tool_call.function_calls:
-                            print(f"[JARVIS] 📞 {fc.name}")
-                            fr = await self._execute_tool(fc)
-                            fn_responses.append(fr)
-                        await self.session.send_tool_response(
-                            function_responses=fn_responses
-                        )
+                        else:
+                            fn_responses = []
+                            for fc in response.tool_call.function_calls:
+                                print(f"[JARVIS] 📞 {fc.name}")
+                                fr = await self._execute_tool(fc)
+                                fn_responses.append(fr)
+                            await self.session.send_tool_response(
+                                function_responses=fn_responses
+                            )
+                    if turn_should_reset:
+                        current_audio_chunks = []
+                        in_buf = []
+                        self._current_audio_turn_ignored = False
+                        self._current_audio_turn_ignore_reason = None
+                        self._current_audio_turn_wake_word_only = False
         except Exception as e:
             print(f"[JARVIS]  Recv error: {e}")
             if _live_resilience_enabled():

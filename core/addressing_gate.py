@@ -4,8 +4,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
+import time
 import unicodedata
 from typing import Iterable
+
+from core.voice_activation_state import (
+    arm_voice_activation,
+    clear_voice_activation,
+    consume_voice_activation,
+    get_voice_activation_state,
+)
 
 _SPACE_RE = re.compile(r"\s+")
 _WORD_RE = re.compile(r"\w+", re.UNICODE)
@@ -119,3 +127,38 @@ def should_process_user_utterance(
         return GateDecision(False, "not_addressed", "", None)
 
     return GateDecision(True, "wake_word_matched", strip_wake_word(raw), matched)
+
+
+def should_process_audio_utterance(
+    text: str,
+    wake_words: list[str] | None = None,
+    timeout_seconds: float = 10.0,
+) -> GateDecision:
+    raw = (text or "").strip()
+    if not raw:
+        return GateDecision(False, "empty_text", "", None)
+
+    try:
+        tokens = _tokens(raw)
+        matched, _ = _match_wake_word_tokens(tokens, wake_words=wake_words)
+    except Exception as exc:  # fail closed for audio
+        return GateDecision(False, f"gate_error:{exc}", "", None)
+
+    if matched:
+        stripped = strip_wake_word(raw, wake_words=wake_words)
+        clear_voice_activation()
+        if not stripped:
+            arm_voice_activation(matched, timeout_seconds=timeout_seconds, activation_text=raw)
+            return GateDecision(True, "wake_word_only", "", matched)
+        return GateDecision(True, "wake_word_matched", stripped, matched)
+
+    state = get_voice_activation_state()
+    if state.armed_until:
+        now = time.time()
+        if state.armed_until <= now:
+            clear_voice_activation()
+            return GateDecision(False, "armed_expired", "", state.matched_wake_word)
+        if consume_voice_activation():
+            return GateDecision(True, "armed_followup", raw, state.matched_wake_word)
+
+    return GateDecision(False, "not_addressed", "", None)
