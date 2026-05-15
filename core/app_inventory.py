@@ -33,6 +33,10 @@ class AppCandidate:
     status: str = "not_found"
     confidence: float = 0.0
     evidence: str = ""
+    candidate_kind: str = "unknown"
+    rank_score: int = 0
+    rank_reason: str = ""
+    is_primary_app_candidate: bool = False
 
     def to_dict(self):
         return asdict(self)
@@ -89,17 +93,117 @@ def classify_candidate(candidate: AppCandidate) -> str:
 
     return "installed_verified"
 
-def is_stale_candidate(candidate: AppCandidate) -> bool:
-    """Checks if a candidate is no longer valid."""
-    if not candidate.executable_path:
-        return True
-    return not os.path.exists(candidate.executable_path)
+def classify_candidate_kind(candidate: AppCandidate) -> str:
+    """Classifies the kind of app candidate based on name and path."""
+    name = (candidate.name or "").lower()
+    path = (candidate.executable_path or "").lower()
+    
+    if "uninstall" in name or "uninstall" in path: return "uninstaller"
+    if any(k in name or k in path for k in ["installer", "setup", "install"]): return "installer"
+    if "tunnel" in name or "tunnel" in path: return "tunnel"
+    if "service" in name or "service" in path: return "service"
+    if any(k in name or k in path for k in ["updater", "update"]): return "helper_binary"
+    if any(k in name or k in path for k in ["helper", "crashpad", "telemetry"]): return "helper_binary"
+    if "launcher" in name or "launcher" in path: return "launcher"
+    
+    if "powershell" in name:
+        if "ise" in name or "developer" in name:
+            return "developer_shell"
+            
+    if candidate.source == "shortcut":
+        return "gui_app"
+    
+    if candidate.source == "registry" and candidate.executable_path:
+        return "gui_app"
+        
+    if "system32" in path or "syswow64" in path:
+        return "system_tool"
+        
+    if candidate.source == "path":
+        return "cli_tool"
+        
+    return "unknown"
+
+def rank_candidate(candidate: AppCandidate, query: str):
+    """Calculates rank score and reason for a candidate."""
+    score = 0
+    reasons = []
+    kind = classify_candidate_kind(candidate)
+    candidate.candidate_kind = kind
+    
+    q_norm = query.lower()
+    name_low = candidate.name.lower()
+    
+    # Kind-based base score
+    kind_scores = {
+        "gui_app": 100,
+        "launcher": 90,
+        "developer_shell": 50,
+        "system_tool": 40,
+        "cli_tool": 30,
+        "unknown": 10,
+        "tunnel": -50,
+        "service": -50,
+        "helper_binary": -60,
+        "installer": -100,
+        "uninstaller": -100
+    }
+    score += kind_scores.get(kind, 0)
+    reasons.append(f"kind:{kind}({kind_scores.get(kind, 0)})")
+    
+    # Source boost
+    if candidate.source == "shortcut":
+        score += 20
+        reasons.append("source:shortcut(+20)")
+    elif candidate.source == "registry":
+        score += 10
+        reasons.append("source:registry(+10)")
+        
+    # Name match boost
+    if name_low == q_norm:
+        score += 50
+        reasons.append("exact_name_match(+50)")
+    elif q_norm in name_low:
+        score += 10
+        reasons.append("partial_name_match(+10)")
+        
+    # Path heuristics
+    path = (candidate.executable_path or "").lower()
+    if path:
+        # Avoid common sub-folders for primary apps
+        if any(x in path for x in ["\\bin\\", "\\tools\\", "\\resources\\", "\\app\\"]):
+            score -= 10
+            reasons.append("path:subfolder(-10)")
+        if "cursor-tunnel" in path or "cursor-tunnel" in name_low:
+            score -= 40
+            reasons.append("path:tunnel_keyword(-40)")
+            
+    # Keywords penalties
+    if any(k in name_low or k in path for k in ["updater", "update"]):
+        score -= 20
+        reasons.append("name:updater_keyword(-20)")
+    if any(k in name_low or k in path for k in ["helper", "crashpad", "telemetry"]):
+        score -= 10
+        reasons.append("name:helper_keyword(-10)")
+
+    # PowerShell specific rules
+    if "powershell" in q_norm:
+        if "ise" in name_low and "ise" not in q_norm:
+            score -= 80
+            reasons.append("powershell:ise_not_requested(-80)")
+        if "developer" in name_low and "developer" not in q_norm:
+            score -= 80
+            reasons.append("powershell:developer_not_requested(-80)")
+
+    candidate.rank_score = score
+    candidate.rank_reason = "; ".join(reasons)
+    candidate.is_primary_app_candidate = (score >= 80)
 
 class AppInventory:
     def __init__(self):
         self.candidates: List[AppCandidate] = []
 
-    def _add_candidate(self, name: str, exe_path: Optional[str], source: str, evidence: str, confidence: float = 0.8):
+    def _add_candidate(self, name: str, exe_path: Optional[str], source: str, evidence: str, confidence: float = 0.8, query_context: Optional[str] = None):
         norm = normalize_app_query(name)
 
         # Guard against forbidden overlaps
@@ -122,6 +226,10 @@ class AppInventory:
             confidence=confidence
         )
         candidate.status = classify_candidate(candidate)
+        
+        # Rank it using name as a proxy for the query if context not provided
+        rank_candidate(candidate, query_context or name)
+        
         self.candidates.append(candidate)
 
     def scan_path(self):
@@ -255,10 +363,9 @@ def find_app_candidates(query: str, inventory: Optional[AppInventory] = None) ->
     matches = []
 
     for c in inventory.candidates:
-        if c.normalized_name == norm_query:
-            matches.append(c)
-        elif norm_query in c.normalized_name or c.normalized_name in norm_query:
-            # Fuzzy match
+        if c.normalized_name == norm_query or norm_query in c.normalized_name or c.normalized_name in norm_query:
+            # Re-rank based on ACTUAL query
+            rank_candidate(c, query)
             matches.append(c)
 
     return matches
@@ -287,14 +394,27 @@ def resolve_trusted_app(query: str, inventory: Optional[AppInventory] = None) ->
         if norm_query == "visual studio code" and "codex" in c.normalized_name: continue
         if norm_query == "internet explorer" and "explorer" in c.normalized_name and "internet" not in c.normalized_name: continue
 
+        # Never auto-select installer/uninstaller unless specifically requested
+        if c.candidate_kind in ["installer", "uninstaller"]:
+            kind_keywords = ["install", "setup", "uninstall"]
+            if not any(k in query.lower() for k in kind_keywords):
+                continue
+
         if c.status != "stale":
             trusted.append(c)
 
     if not trusted:
-        # All candidates are stale
-        return {"status": "stale", "query": query, "candidate": candidates[0]}
+        # All candidates are stale or filtered by policy
+        # If we had at least one candidate that wasn't stale, but it was filtered, return not_found
+        for c in candidates:
+            if c.status != "stale" and c not in trusted:
+                return {"status": "not_found", "query": query, "candidate": None}
+        
+        if candidates:
+            return {"status": "stale", "query": query, "candidate": candidates[0]}
+        return {"status": "not_found", "query": query, "candidate": None}
 
-    # Sort by confidence and status priority
+    # Sort by Rank Score (Primary), then status priority, then confidence
     status_priority = {
         "running": 0,
         "installed_verified": 1,
@@ -303,15 +423,21 @@ def resolve_trusted_app(query: str, inventory: Optional[AppInventory] = None) ->
         "stale": 4
     }
 
-    trusted.sort(key=lambda x: (status_priority.get(x.status, 99), -x.confidence))
+    # Ranking is the main decision factor now
+    trusted.sort(key=lambda x: (-x.rank_score, status_priority.get(x.status, 99), -x.confidence))
 
-    # Check for ambiguity
     best = trusted[0]
-    others = [t for t in trusted[1:] if t.normalized_name != best.normalized_name]
-
+    
+    # If the best candidate is significantly better than others, no ambiguity
+    # Use human-readable name for ambiguity check if scores are close
+    others = [t for t in trusted[1:] if t.name.lower() != best.name.lower()]
+    
     if others:
-        # If we have multiple different normalized names that are equally strong
-        if status_priority.get(best.status) == status_priority.get(others[0].status):
+        best_score = best.rank_score
+        second_best_score = others[0].rank_score
+        
+        # If score difference is small (< 15) and both are strong, it's ambiguous
+        if abs(best_score - second_best_score) < 15:
             return {"status": "ambiguous", "query": query, "candidates": trusted}
 
     return {"status": best.status, "query": query, "candidate": best}
