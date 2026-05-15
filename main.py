@@ -17,6 +17,18 @@ from memory.memory_manager import (
     load_memory, update_memory, format_memory_for_prompt,
 )
 from memory_engine.runtime_context import build_readonly_memory_context_from_env
+from core.intent_confidence import (
+    classify_user_intent,
+    transcript_quality_score,
+    validate_tool_call_against_user_text,
+)
+from core.response_discipline import (
+    concise_clarification,
+    enforce_portuguese_local_reply,
+    is_explicit_language_change_request,
+    portuguese_default_instruction,
+    tool_truthfulness_instruction,
+)
 from core.speech_control import (
     SpeechCommandType,
     SpeechControlState,
@@ -998,6 +1010,29 @@ class JarvisLive:
         if self._handle_speech_control_command(text, source="text"):
             return
 
+        user_intent = classify_user_intent(text)
+        transcript_quality = transcript_quality_score(text)
+        if (
+            user_intent["intent"] == "unknown"
+            and (user_intent["confidence"] < 0.35 or transcript_quality < 0.35)
+            and "?" not in (text or "")
+            and not is_explicit_language_change_request(text)
+            and not user_intent["normalized_text"].startswith(("oi", "ola", "olá", "hello"))
+        ):
+            clarification = enforce_portuguese_local_reply(concise_clarification("Não entendi com segurança. Pode repetir?"))
+            self.speak(clarification)
+            record_event(
+                "tool_blocked_low_confidence",
+                "text_command",
+                clarification[:200],
+                metadata={
+                    "intent": user_intent["intent"],
+                    "confidence": user_intent["confidence"],
+                    "reason": user_intent["reason"],
+                },
+            )
+            return
+
         # Context Awareness Interception
         if self._handle_context_query(text):
             return
@@ -1083,6 +1118,8 @@ class JarvisLive:
         ro_memory_context = build_readonly_memory_context_from_env()
         if ro_memory_context:
             parts.append(ro_memory_context)
+        parts.append(portuguese_default_instruction())
+        parts.append(tool_truthfulness_instruction())
         if _speech_control_enabled() and self._speech_control_state.concise_mode:
             parts.append("[SPEECH CONTROL]\nResponda de forma curta e direta.\n")
         parts.append(sys_prompt)
@@ -1106,6 +1143,35 @@ class JarvisLive:
     async def _execute_tool(self, fc) -> types.FunctionResponse:
         name = fc.name
         args = dict(fc.args or {})
+
+        validation = validate_tool_call_against_user_text(name, args, self.last_user_text)
+        if not validation.get("allow", True):
+            clarification = enforce_portuguese_local_reply(
+                validation.get("clarification") or concise_clarification("Não entendi com segurança. Pode repetir?")
+            )
+            record_event(
+                "tool_blocked_low_confidence",
+                name,
+                clarification[:200],
+                metadata={
+                    "intent": validation.get("intent", "unknown"),
+                    "confidence": validation.get("confidence", 0.0),
+                    "reason": validation.get("reason", "low_confidence"),
+                },
+                correlation_id=fc.id,
+            )
+            if clarification:
+                self.speak(clarification)
+            return types.FunctionResponse(
+                id=fc.id,
+                name=name,
+                response={
+                    "result": "blocked_low_confidence",
+                    "intent": validation.get("intent", "unknown"),
+                    "confidence": validation.get("confidence", 0.0),
+                    "reason": validation.get("reason", "low_confidence"),
+                },
+            )
 
         # Concurrent mode logic
         if _concurrent_runtime_enabled() and _tool_can_run_background(name, args):
@@ -1214,6 +1280,35 @@ class JarvisLive:
             else:
                 if msg: self.speak(msg)
                 return f"Denied: {msg}"
+
+        validation = validate_tool_call_against_user_text(name, args, self.last_user_text)
+        if not validation.get("allow", True):
+            clarification = enforce_portuguese_local_reply(
+                validation.get("clarification") or concise_clarification("Não entendi com segurança. Pode repetir?")
+            )
+            record_event(
+                "tool_blocked_low_confidence",
+                name,
+                clarification[:200],
+                metadata={
+                    "intent": validation.get("intent", "unknown"),
+                    "confidence": validation.get("confidence", 0.0),
+                    "reason": validation.get("reason", "low_confidence"),
+                },
+                correlation_id=fc.id,
+            )
+            if clarification:
+                self.speak(clarification)
+            return types.FunctionResponse(
+                id=fc.id,
+                name=name,
+                response={
+                    "result": "blocked_low_confidence",
+                    "intent": validation.get("intent", "unknown"),
+                    "confidence": validation.get("confidence", 0.0),
+                    "reason": validation.get("reason", "low_confidence"),
+                },
+            )
 
         print(f"[JARVIS] TOOL: {name} {args}")
         self._safe_set_state("THINKING")
