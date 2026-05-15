@@ -850,12 +850,46 @@ class JarvisLive:
             else:
                 raise
 
+    def _handle_context_query(self, text: str) -> bool:
+        """Handles contextual questions about current state/tasks. Returns True if handled."""
+        from core.context_awareness import answer_context_question
+        
+        try:
+            ctx_res = answer_context_question(text)
+            if ctx_res["intent"] != "unknown_context_query" and ctx_res["confidence"] > 0.7:
+                # Handle the answer
+                answer = ctx_res["answer"]
+                self.speak(answer)
+                self._safe_write_log(f"Jarvis (Context): {answer}")
+                
+                # Handle suggested action (e.g. open_app)
+                if ctx_res["suggested_action"]:
+                    action = ctx_res["suggested_action"]
+                    if action["tool"] == "open_app":
+                        app_name = action["args"].get("app_name")
+                        if app_name:
+                            print(f"[JARVIS] Context-triggered action: open_app {app_name}")
+                            # Schedule the tool call
+                            asyncio.run_coroutine_threadsafe(
+                                self._call_tool_implementation("open_app", {"app_name": app_name}),
+                                self._loop
+                            )
+                return True
+        except Exception as e:
+            print(f"[JARVIS] Context awareness error (fail-open): {e}")
+            
+        return False
+
     def _on_text_command(self, text: str):
         if not self._loop or not self.session:
             return
 
         record_event("user_input", "text_command", text[:200], metadata={"input_type": "text"})
         self.last_user_text = text
+
+        # Context Awareness Interception
+        if self._handle_context_query(text):
+            return
 
         # Phase 5B: Action Decision Gate
         allowed, msg = _apply_action_decision_gate(text)

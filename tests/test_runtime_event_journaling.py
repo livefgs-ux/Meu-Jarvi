@@ -13,6 +13,9 @@ from main import JarvisLive
 class TestRuntimeEventJournaling(unittest.TestCase):
 
     def setUp(self):
+        self._orig_env = os.environ.copy()
+        os.environ["JARVIS_LIVE_RESILIENCE"] = "false"
+        os.environ["JARVIS_CONCURRENT_TASK_RUNTIME"] = "false"
         self.timeline = get_runtime_timeline()
         self.timeline.clear()
         self.mock_ui = MagicMock()
@@ -24,6 +27,8 @@ class TestRuntimeEventJournaling(unittest.TestCase):
         self.jarvis._loop = self.loop
 
     def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._orig_env)
         self.loop.close()
 
     def test_record_event_fail_open(self):
