@@ -1540,6 +1540,7 @@ class JarvisLive:
                     turn_ignore_reason = self._current_audio_turn_ignore_reason
                     turn_was_wake_word_only = self._current_audio_turn_wake_word_only
                     turn_should_reset = False
+                    response_allows_tools = not (turn_was_ignored or turn_was_wake_word_only)
 
                     if response.data:
                         if self._suppress_audio_until_turn_complete:
@@ -1567,6 +1568,7 @@ class JarvisLive:
                                     self._current_audio_turn_ignore_reason = "speech_control"
                                     self._current_audio_turn_wake_word_only = False
                                     self._suppress_audio_until_turn_complete = True
+                                    response_allows_tools = False
                                     clear_followup_buffer()
                                     in_buf = []
                                     current_audio_chunks = []
@@ -1590,7 +1592,7 @@ class JarvisLive:
                                     elif decision.reason == "wake_word_only":
                                         wake_word = (decision.matched_wake_word or "wake word").strip()
                                         print(f"[AddressingGate] wake word detected: {wake_word}")
-                                        print("[AddressingGate] armed for 10s")
+                                        print("[AddressingGate] wake word only -> armed for 10s")
                                         record_event(
                                             "voice_activation_armed",
                                             "AddressingGate",
@@ -1605,6 +1607,7 @@ class JarvisLive:
                                         self._current_audio_turn_ignore_reason = None
                                         self._current_audio_turn_wake_word_only = True
                                         self._suppress_audio_until_turn_complete = True
+                                        response_allows_tools = False
                                         clear_followup_buffer()
                                         in_buf = []
                                         current_audio_chunks = []
@@ -1626,6 +1629,7 @@ class JarvisLive:
                                         self._current_audio_turn_ignored = False
                                         self._current_audio_turn_ignore_reason = None
                                         self._current_audio_turn_wake_word_only = False
+                                        response_allows_tools = True
                                         clear_followup_buffer()
                                         in_buf = [decision.stripped_text] if decision.stripped_text else []
                                         current_audio_chunks = [decision.stripped_text] if decision.stripped_text else []
@@ -1635,6 +1639,7 @@ class JarvisLive:
                                         self._current_audio_turn_ignored = False
                                         self._current_audio_turn_ignore_reason = None
                                         self._current_audio_turn_wake_word_only = False
+                                        response_allows_tools = True
                                         clear_followup_buffer()
                                         in_buf = [decision.stripped_text] if decision.stripped_text else []
                                         current_audio_chunks = [decision.stripped_text] if decision.stripped_text else []
@@ -1650,6 +1655,7 @@ class JarvisLive:
                                         self._current_audio_turn_ignore_reason = "armed_expired"
                                         self._current_audio_turn_wake_word_only = False
                                         self._suppress_audio_until_turn_complete = True
+                                        response_allows_tools = False
                                         clear_followup_buffer()
                                         in_buf = []
                                         current_audio_chunks = []
@@ -1666,10 +1672,11 @@ class JarvisLive:
                                         self._current_audio_turn_ignore_reason = "armed_fragment"
                                         self._current_audio_turn_wake_word_only = False
                                         self._suppress_audio_until_turn_complete = True
+                                        response_allows_tools = False
                                         in_buf = []
                                         current_audio_chunks = []
                                     elif decision.reason == "armed_non_meaningful":
-                                        print("[AddressingGate] follow-up ignored: non meaningful")
+                                        print("[AddressingGate] weak follow-up ignored, still armed")
                                         record_event(
                                             "ignored_non_meaningful_followup",
                                             "AddressingGate",
@@ -1680,14 +1687,16 @@ class JarvisLive:
                                         self._current_audio_turn_ignore_reason = "armed_non_meaningful"
                                         self._current_audio_turn_wake_word_only = False
                                         self._suppress_audio_until_turn_complete = True
+                                        response_allows_tools = False
                                         in_buf = []
                                         current_audio_chunks = []
                                     else:
-                                        print("[AddressingGate] ignored: not addressed")
+                                        print("[AddressingGate] state=IDLE ignored: not addressed")
                                         self._current_audio_turn_ignored = True
                                         self._current_audio_turn_ignore_reason = decision.reason or "not_addressed"
                                         self._current_audio_turn_wake_word_only = False
                                         self._suppress_audio_until_turn_complete = True
+                                        response_allows_tools = False
                                         clear_followup_buffer()
                                         in_buf = []
 
@@ -1727,7 +1736,7 @@ class JarvisLive:
                             out_buf = []
 
                     if response.tool_call:
-                        if self._current_audio_turn_ignored or self._current_audio_turn_wake_word_only or turn_was_ignored or turn_was_wake_word_only:
+                        if self._current_audio_turn_ignored or self._current_audio_turn_wake_word_only or not response_allows_tools:
                             fn_responses = []
                             for fc in response.tool_call.function_calls:
                                 fn_responses.append(

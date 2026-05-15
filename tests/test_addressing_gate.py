@@ -97,6 +97,13 @@ class TestAddressingGate(unittest.TestCase):
         self.assertEqual(decision.reason, "armed_non_meaningful")
         self.assertTrue(get_voice_activation_state().armed_until > 0)
 
+    def test_listening_phrase_after_wake_does_not_consume_window(self):
+        arm_voice_activation("jarvis", timeout_seconds=10.0, activation_text="Jarvis")
+        decision = should_process_audio_utterance("tá ouvindo")
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason, "armed_non_meaningful")
+        self.assertTrue(get_voice_activation_state().armed_until > 0)
+
     def test_meaningful_followup_consumes_window(self):
         arm_voice_activation("jarvis", timeout_seconds=10.0, activation_text="Jarvis")
         self.assertTrue(is_meaningful_followup("pesquisa novidades sobre IA"))

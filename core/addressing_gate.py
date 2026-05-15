@@ -32,6 +32,32 @@ DEFAULT_WAKE_WORDS = (
 )
 
 _LEADING_FILLERS = {"oi", "ola", "hey", "ei", "ok", "okay", "por favor", "pf"}
+_NOISE_PHRASES = {
+    "sim",
+    "online",
+    "ok",
+    "ah",
+    "hum",
+    "ta",
+    "ne",
+    "certo",
+    "beleza",
+    "oi",
+    "estou",
+    "esta",
+    "to",
+    "sou",
+    "sao",
+    "ta ouvindo",
+    "estou ouvindo",
+    "to ouvindo",
+    "ouvindo",
+    "consegue me ouvir",
+    "me ouve",
+    "me escuta",
+    "tudo bem",
+    "fala ai",
+}
 _NOISE_SINGLETONS = {
     "online",
     "sim",
@@ -96,6 +122,25 @@ def _tokens(text: str) -> list[str]:
     return _WORD_RE.findall(text or "")
 
 
+def _strip_leading_noise_phrases(text: str) -> str:
+    raw = normalize_address_text(text)
+    if not raw:
+        return ""
+
+    phrases = sorted(_NOISE_PHRASES, key=lambda value: len(value.split()), reverse=True)
+    changed = True
+    while changed and raw:
+        changed = False
+        for phrase in phrases:
+            if raw == phrase:
+                return ""
+            if raw.startswith(f"{phrase} "):
+                raw = raw[len(phrase):].strip()
+                changed = True
+                break
+    return raw
+
+
 def normalize_address_text(text: str) -> str:
     tokens = [_normalize_token(tok) for tok in _tokens(text)]
     return _SPACE_RE.sub(" ", " ".join(tok for tok in tokens if tok).strip())
@@ -150,7 +195,7 @@ def strip_wake_word(text: str, wake_words: list[str] | None = None) -> str:
 
 
 def is_meaningful_followup(text: str) -> bool:
-    raw = normalize_address_text(text)
+    raw = _strip_leading_noise_phrases(text)
     if not raw:
         return False
 
@@ -174,7 +219,7 @@ def is_meaningful_followup(text: str) -> bool:
 
 
 def _is_noise_followup(text: str) -> bool:
-    raw = normalize_address_text(text)
+    raw = _strip_leading_noise_phrases(text)
     if not raw:
         return True
 
@@ -186,7 +231,7 @@ def _is_noise_followup(text: str) -> bool:
 
 
 def _is_bufferable_fragment(text: str) -> bool:
-    raw = normalize_address_text(text)
+    raw = _strip_leading_noise_phrases(text)
     if not raw:
         return False
 
