@@ -17,6 +17,11 @@ from memory.memory_manager import (
     load_memory, update_memory, format_memory_for_prompt,
 )
 from memory_engine.runtime_context import build_readonly_memory_context_from_env
+from core.speech_control import (
+    SpeechCommandType,
+    SpeechControlState,
+    detect_speech_control_command,
+)
 from core.runtime_journal import record_event
 from core.task_runtime import get_task_runtime, TaskPriority
 from core.live_resilience import LiveResilienceSupervisor, LiveConnectionState
@@ -76,6 +81,14 @@ def _clean_transcript(text: str) -> str:
     text = _CTRL_RE.sub("", text)
     text = re.sub(r"[\x00-\x08\x0b-\x1f]", "", text)
     return text.strip()
+
+
+def _speech_control_enabled() -> bool:
+    raw = os.environ.get("JARVIS_SPEECH_CONTROL")
+    if raw is None:
+        return False
+    val = str(raw).strip().lower()
+    return val in {"1", "true", "yes", "on"}
 
 
 def _get_memory_write_backend() -> str:
@@ -831,6 +844,8 @@ class JarvisLive:
         self._turn_done_event: asyncio.Event | None = None
         self.last_user_text: str | None = None
         self.resilience = LiveResilienceSupervisor()
+        self._speech_control_state = SpeechControlState()
+        self._suppress_audio_until_turn_complete = False
 
     def _safe_set_state(self, state: str):
         try:
@@ -849,6 +864,99 @@ class JarvisLive:
                 pass
             else:
                 raise
+
+    def _clear_audio_output_queue(self):
+        if not self.audio_in_queue:
+            return
+
+        while True:
+            try:
+                self.audio_in_queue.get_nowait()
+            except Exception:
+                break
+
+    def _stop_current_speech(self):
+        self._suppress_audio_until_turn_complete = True
+        self._clear_audio_output_queue()
+        self.set_speaking(False)
+
+    def _apply_concise_hint(self, text: str) -> str:
+        if not self._speech_control_state.concise_mode:
+            return text
+        return "Responda de forma curta e direta.\n\n" + text
+
+    def _handle_speech_control_command(self, text: str, *, source: str = "text") -> bool:
+        if not _speech_control_enabled():
+            return False
+
+        try:
+            result = detect_speech_control_command(text)
+        except Exception as exc:
+            record_event(
+                "speech_control_error",
+                "SpeechControl",
+                str(exc)[:200],
+                metadata={"source": source},
+                severity="error",
+            )
+            return False
+        command_type = result.get("command_type", SpeechCommandType.NONE.value)
+        if command_type == SpeechCommandType.NONE.value:
+            return False
+
+        matched = result.get("matched_phrase", "")
+        record_event(
+            "speech_control_detected",
+            "SpeechControl",
+            (text or "")[:200],
+            metadata={
+                "source": source,
+                "command_type": command_type,
+                "matched_phrase": matched,
+            },
+        )
+
+        now = time.time()
+        self._speech_control_state.last_command = command_type
+
+        if command_type == SpeechCommandType.INTERRUPT_SPEECH.value:
+            self._speech_control_state.interrupted_at = now
+            self._stop_current_speech()
+            record_event("speech_interrupted", "SpeechControl", "Speech interrupted", metadata={"source": source})
+            return True
+
+        if command_type == SpeechCommandType.TEMPORARY_SILENCE.value:
+            self._speech_control_state.is_silenced = True
+            self._speech_control_state.interrupted_at = now
+            self._speech_control_state.silence_until = None
+            self._stop_current_speech()
+            record_event("speech_silenced", "SpeechControl", "Speech silenced", metadata={"source": source})
+            return True
+
+        if command_type == SpeechCommandType.RESUME_SPEECH.value:
+            self._speech_control_state.is_silenced = False
+            self._speech_control_state.silence_until = None
+            self._suppress_audio_until_turn_complete = False
+            self.set_speaking(False)
+            record_event("speech_resumed", "SpeechControl", "Speech resumed", metadata={"source": source})
+            return True
+
+        if command_type == SpeechCommandType.CONCISE_MODE.value:
+            self._speech_control_state.concise_mode = True
+            record_event("concise_mode_enabled", "SpeechControl", "Concise mode enabled", metadata={"source": source})
+            return True
+
+        if command_type == SpeechCommandType.NORMAL_MODE.value:
+            self._speech_control_state.concise_mode = False
+            record_event("concise_mode_disabled", "SpeechControl", "Concise mode disabled", metadata={"source": source})
+            return True
+
+        if command_type == SpeechCommandType.CANCEL_TASK.value:
+            record_event("task_cancel_requested", "SpeechControl", "Task cancellation requested", metadata={"source": source})
+            self._safe_write_log("SYS: Task cancellation command received.")
+            return True
+
+        return False
 
     def _handle_context_query(self, text: str) -> bool:
         """Handles contextual questions about current state/tasks. Returns True if handled."""
@@ -886,6 +994,9 @@ class JarvisLive:
 
         record_event("user_input", "text_command", text[:200], metadata={"input_type": "text"})
         self.last_user_text = text
+
+        if self._handle_speech_control_command(text, source="text"):
+            return
 
         # Context Awareness Interception
         if self._handle_context_query(text):
@@ -927,9 +1038,20 @@ class JarvisLive:
         elif not self.session:
             return
 
+        if _speech_control_enabled() and self._speech_control_state.is_silenced:
+            record_event(
+                "speech_suppressed",
+                "SpeechControl",
+                str(text)[:200],
+                metadata={"reason": "silenced"},
+            )
+            return
+
+        payload = self._apply_concise_hint(text)
+
         asyncio.run_coroutine_threadsafe(
             self.session.send_client_content(
-                turns={"parts": [{"text": text}]},
+                turns={"parts": [{"text": payload}]},
                 turn_complete=True
             ),
             self._loop
@@ -961,6 +1083,8 @@ class JarvisLive:
         ro_memory_context = build_readonly_memory_context_from_env()
         if ro_memory_context:
             parts.append(ro_memory_context)
+        if _speech_control_enabled() and self._speech_control_state.concise_mode:
+            parts.append("[SPEECH CONTROL]\nResponda de forma curta e direta.\n")
         parts.append(sys_prompt)
 
         return types.LiveConnectConfig(
@@ -1262,12 +1386,16 @@ class JarvisLive:
                 async for response in self.session.receive():
 
                     if response.data:
-                        if self._turn_done_event and self._turn_done_event.is_set():
-                            self._turn_done_event.clear()
-                        self.audio_in_queue.put_nowait(response.data)
+                        if self._suppress_audio_until_turn_complete:
+                            pass
+                        else:
+                            if self._turn_done_event and self._turn_done_event.is_set():
+                                self._turn_done_event.clear()
+                            self.audio_in_queue.put_nowait(response.data)
 
                     if response.server_content:
                         sc = response.server_content
+                        speech_control_handled = False
 
                         if sc.output_transcription and sc.output_transcription.text:
                             txt = _clean_transcript(sc.output_transcription.text)
@@ -1277,11 +1405,16 @@ class JarvisLive:
                         if sc.input_transcription and sc.input_transcription.text:
                             txt = _clean_transcript(sc.input_transcription.text)
                             if txt:
-                                in_buf.append(txt)
+                                if self._handle_speech_control_command(txt, source="audio"):
+                                    speech_control_handled = True
+                                    in_buf = []
+                                elif not speech_control_handled:
+                                    in_buf.append(txt)
 
                         if sc.turn_complete:
                             if self._turn_done_event:
                                 self._turn_done_event.set()
+                            self._suppress_audio_until_turn_complete = False
 
                             full_in = " ".join(in_buf).strip()
                             if full_in:
@@ -1341,6 +1474,8 @@ class JarvisLive:
                     ):
                         self.set_speaking(False)
                         self._turn_done_event.clear()
+                    continue
+                if self._suppress_audio_until_turn_complete:
                     continue
                 self.set_speaking(True)
                 await asyncio.to_thread(stream.write, chunk)
