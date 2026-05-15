@@ -5,7 +5,7 @@ import tempfile
 import shutil
 from pathlib import Path
 from core.app_inventory import (
-    AppCandidate, AppInventory, normalize_app_query, 
+    AppCandidate, AppInventory, normalize_app_query,
     resolve_trusted_app, save_inventory_cache, load_inventory_cache,
     classify_candidate
 )
@@ -27,7 +27,7 @@ class TestAppInventory(unittest.TestCase):
             c = AppCandidate(name="FakeApp", normalized_name="fakeapp", executable_path=fake_exe, source="registry")
             c.status = classify_candidate(c)
             self.assertEqual(c.status, "stale")
-            
+
             c2 = AppCandidate(name="FakeApp", normalized_name="fakeapp", executable_path=None, source="registry")
             c2.status = classify_candidate(c2)
             self.assertEqual(c2.status, "registry_only")
@@ -51,14 +51,14 @@ class TestAppInventory(unittest.TestCase):
         inventory = AppInventory()
         # Add a "Cursor" candidate that mentions "code.exe" (sometimes happens if based on VS Code)
         inventory.candidates.append(AppCandidate(
-            name="Cursor", normalized_name="cursor", 
+            name="Cursor", normalized_name="cursor",
             executable_path="C:\\Users\\User\\AppData\\Local\\Programs\\Cursor\\resources\\app\\bin\\code.exe",
             status="installed_verified", source="registry"
         ))
-        
+
         res = resolve_trusted_app("VS Code", inventory)
         self.assertEqual(res["status"], "not_found")
-        
+
         res_cursor = resolve_trusted_app("Cursor", inventory)
         # Even if it has code.exe in path, it should match "cursor" query
         # But our guard in _add_candidate prevents this overlap during scan.
@@ -77,7 +77,7 @@ class TestAppInventory(unittest.TestCase):
     def test_cursor_does_not_resolve_to_vscode(self):
         inventory = AppInventory()
         inventory.candidates.append(AppCandidate(
-            name="Visual Studio Code", normalized_name="visual studio code", 
+            name="Visual Studio Code", normalized_name="visual studio code",
             executable_path="C:\\Program Files\\VSCode\\Code.exe",
             status="installed_verified"
         ))
@@ -87,7 +87,7 @@ class TestAppInventory(unittest.TestCase):
     def test_internet_explorer_does_not_resolve_to_file_explorer(self):
         inventory = AppInventory()
         inventory.candidates.append(AppCandidate(
-            name="Windows Explorer", normalized_name="windows file explorer", 
+            name="Windows Explorer", normalized_name="windows file explorer",
             executable_path="C:\\Windows\\explorer.exe",
             status="installed_verified"
         ))
@@ -117,13 +117,13 @@ class TestAppInventory(unittest.TestCase):
     def test_cache_roundtrip_uses_tempdir(self):
         inventory = AppInventory()
         inventory.candidates.append(AppCandidate(name="Test", normalized_name="test", status="running"))
-        
+
         with tempfile.TemporaryDirectory() as tmp:
             cache_path = os.path.join(tmp, "cache.json")
             save_inventory_cache(inventory, cache_path)
             self.assertTrue(os.path.exists(cache_path))
-            
-            loaded = load_inventory_cache(cache_path)
+
+            loaded, _ = load_inventory_cache(cache_path)
             self.assertEqual(len(loaded.candidates), 1)
             self.assertEqual(loaded.candidates[0].name, "Test")
 
@@ -134,7 +134,7 @@ class TestAppInventory(unittest.TestCase):
         content = path.read_text(encoding="utf-8")
         forbidden = ["subprocess.Popen", "os.startfile", "subprocess.call", "subprocess.run"]
         for f in forbidden:
-            # Note: subprocess.run might be used for light scanning in some impls, 
+            # Note: subprocess.run might be used for light scanning in some impls,
             # but here we avoided it.
             self.assertNotIn(f, content, f"Forbidden call found: {f}")
 

@@ -2,12 +2,15 @@ import os
 import json
 import platform
 import shutil
+import time
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import List, Optional, Dict
 import re
 
 _IS_WINDOWS = platform.system() == "Windows"
+APP_INVENTORY_CACHE_TTL_SECONDS = 86400  # 24 hours
+DEFAULT_CACHE_PATH = ".local_state/app_inventory.json"
 
 if _IS_WINDOWS:
     import winreg
@@ -40,7 +43,7 @@ def normalize_app_query(query: str) -> str:
     # Remove common extensions if present
     if q.endswith(".exe"):
         q = q[:-4]
-    
+
     # Specific mappings to canonical names
     mapping = {
         "vscode": "visual studio code",
@@ -63,11 +66,11 @@ def classify_candidate(candidate: AppCandidate) -> str:
         if candidate.source == "registry":
             return "registry_only"
         return "not_found"
-    
+
     path = Path(candidate.executable_path)
     if not path.exists():
         return "stale"
-    
+
     # Check if it's currently running (if psutil available)
     if _HAS_PSUTIL:
         try:
@@ -83,7 +86,7 @@ def classify_candidate(candidate: AppCandidate) -> str:
 
     if candidate.source == "shortcut":
         return "shortcut_valid"
-    
+
     return "installed_verified"
 
 def is_stale_candidate(candidate: AppCandidate) -> bool:
@@ -98,7 +101,7 @@ class AppInventory:
 
     def _add_candidate(self, name: str, exe_path: Optional[str], source: str, evidence: str, confidence: float = 0.8):
         norm = normalize_app_query(name)
-        
+
         # Guard against forbidden overlaps
         if norm == "cursor" and exe_path and "code.exe" in exe_path.lower():
             return
@@ -138,13 +141,13 @@ class AppInventory:
     def scan_registry(self):
         """Scans Windows Registry for installed applications."""
         if not _IS_WINDOWS: return
-        
+
         paths = [
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
             (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
             (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall")
         ]
-        
+
         for root, subkey in paths:
             try:
                 with winreg.OpenKey(root, subkey) as key:
@@ -158,7 +161,7 @@ class AppInventory:
                                         install_location, _ = winreg.QueryValueEx(app_key, "InstallLocation")
                                     except FileNotFoundError:
                                         install_location = ""
-                                    
+
                                     # Try to find an executable in install location
                                     exe_path = None
                                     if install_location and os.path.isdir(install_location):
@@ -170,7 +173,7 @@ class AppInventory:
                                                         exe_path = os.path.join(root_dir, f)
                                                         break
                                             if exe_path: break
-                                    
+
                                     self._add_candidate(display_name, exe_path, "registry", f"Registry: {subkey}\\{name}", 0.9)
                                 except (FileNotFoundError, OSError):
                                     continue
@@ -182,16 +185,16 @@ class AppInventory:
     def scan_start_menu(self):
         """Scans Start Menu shortcuts."""
         if not _IS_WINDOWS: return
-        
+
         roots = [
             Path(os.environ.get("ProgramData", "C:\\ProgramData")) / "Microsoft\\Windows\\Start Menu\\Programs",
             Path(os.environ.get("AppData", "")) / "Microsoft\\Windows\\Start Menu\\Programs"
         ]
-        
+
         for root in roots:
             if not root.exists(): continue
             for item in root.rglob("*.lnk"):
-                # We don't resolve the shortcut here to avoid heavy dependencies 
+                # We don't resolve the shortcut here to avoid heavy dependencies
                 # unless we find a light way. For now, we treat the shortcut name as a candidate.
                 # In a real impl, we'd use Shell32 or similar.
                 self._add_candidate(item.stem, None, "shortcut", f"Start Menu: {item}", 0.8)
@@ -203,7 +206,7 @@ class AppInventory:
             Path(os.environ.get("ProgramFiles(x86)", "C:\\Program Files (x86)")),
             Path(os.environ.get("LocalAppData", "")) / "Programs"
         ]
-        
+
         for root in roots:
             if not root.exists(): continue
             try:
@@ -247,26 +250,35 @@ def build_app_inventory(light_scan=True) -> AppInventory:
 def find_app_candidates(query: str, inventory: Optional[AppInventory] = None) -> List[AppCandidate]:
     if inventory is None:
         inventory = build_app_inventory(light_scan=False)
-    
+
     norm_query = normalize_app_query(query)
     matches = []
-    
+
     for c in inventory.candidates:
         if c.normalized_name == norm_query:
             matches.append(c)
         elif norm_query in c.normalized_name or c.normalized_name in norm_query:
             # Fuzzy match
             matches.append(c)
-            
+
     return matches
 
 def resolve_trusted_app(query: str, inventory: Optional[AppInventory] = None) -> Dict:
+    if inventory is None:
+        inventory = get_cached_or_build_inventory(light_scan=False)
+
     candidates = find_app_candidates(query, inventory)
     norm_query = normalize_app_query(query)
-    
+
     if not candidates:
-        return {"status": "not_found", "query": query, "candidate": None}
-    
+        alternatives = find_alternative_apps(query, inventory)
+        return {
+            "status": "not_found",
+            "query": query,
+            "candidate": None,
+            "alternatives": alternatives
+        }
+
     # Filter out forbidden overlaps explicitly again
     trusted = []
     for c in candidates:
@@ -274,14 +286,14 @@ def resolve_trusted_app(query: str, inventory: Optional[AppInventory] = None) ->
         if norm_query == "cursor" and "visual studio code" in c.normalized_name: continue
         if norm_query == "visual studio code" and "codex" in c.normalized_name: continue
         if norm_query == "internet explorer" and "explorer" in c.normalized_name and "internet" not in c.normalized_name: continue
-        
+
         if c.status != "stale":
             trusted.append(c)
-            
+
     if not trusted:
         # All candidates are stale
         return {"status": "stale", "query": query, "candidate": candidates[0]}
-    
+
     # Sort by confidence and status priority
     status_priority = {
         "running": 0,
@@ -290,13 +302,13 @@ def resolve_trusted_app(query: str, inventory: Optional[AppInventory] = None) ->
         "registry_only": 3,
         "stale": 4
     }
-    
+
     trusted.sort(key=lambda x: (status_priority.get(x.status, 99), -x.confidence))
-    
+
     # Check for ambiguity
     best = trusted[0]
     others = [t for t in trusted[1:] if t.normalized_name != best.normalized_name]
-    
+
     if others:
         # If we have multiple different normalized names that are equally strong
         if status_priority.get(best.status) == status_priority.get(others[0].status):
@@ -304,20 +316,97 @@ def resolve_trusted_app(query: str, inventory: Optional[AppInventory] = None) ->
 
     return {"status": best.status, "query": query, "candidate": best}
 
+def find_alternative_apps(query: str, inventory: AppInventory) -> List[str]:
+    norm = normalize_app_query(query)
+    alts = []
+
+    related = {
+        "visual studio code": ["cursor", "codex"],
+        "google chrome": ["microsoft edge"],
+        "internet explorer": ["microsoft edge"]
+    }
+
+    targets = related.get(norm, [])
+    for target_norm in targets:
+        # Check if target exists in inventory
+        for c in inventory.candidates:
+            if c.normalized_name == target_norm and c.status != "stale":
+                alts.append(c.name)
+                break
+
+    return list(set(alts))
+
+def get_cached_or_build_inventory(light_scan=True, force_refresh=False, cache_path=None) -> AppInventory:
+    if cache_path is None:
+        cache_path = DEFAULT_CACHE_PATH
+
+    if not force_refresh and os.path.exists(cache_path):
+        try:
+            inventory, timestamp = load_inventory_cache(cache_path)
+            if time.time() - timestamp < APP_INVENTORY_CACHE_TTL_SECONDS:
+                return inventory
+        except Exception:
+            pass
+
+    # Rebuild
+    inventory = build_app_inventory(light_scan=light_scan)
+    save_inventory_cache(inventory, cache_path)
+    return inventory
+
+def format_app_resolution_message(query: str, resolution: Dict) -> str:
+    status = resolution.get("status")
+    name = resolution.get("candidate").name if resolution.get("candidate") else query
+
+    if status == "not_found":
+        msg = f"{query} não está instalado ou não foi encontrado neste PC."
+        alternatives = resolution.get("alternatives", [])
+        if alternatives:
+            msg += f" Encontrei alternativas: {', '.join(alternatives)}."
+
+        # Special case for IE
+        if normalize_app_query(query) == "internet explorer":
+            msg += " Você pode tentar usar o Microsoft Edge no modo IE."
+
+        return msg
+
+    if status == "stale":
+        return f"Encontrei registros antigos ou atalhos quebrados para {name}, mas nenhum executável válido."
+
+    if status == "ambiguous":
+        candidates = resolution.get("candidates", [])
+        names = ", ".join([c.name for c in candidates[:3]])
+        return f"Encontrei mais de um aplicativo parecido: {names}. Qual deles você quer abrir?"
+
+    if status == "registry_only":
+        return f"Encontrei uma entrada de {name} no Registro do Windows, mas não consegui verificar o executável. Não vou abrir automaticamente."
+
+    return f"Resultado inesperado para {query} (Status: {status})."
+
 def save_inventory_cache(inventory: AppInventory, path: str):
-    data = [c.to_dict() for c in inventory.candidates]
+    data = {
+        "timestamp": time.time(),
+        "candidates": [c.to_dict() for c in inventory.candidates]
+    }
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
-def load_inventory_cache(path: str) -> AppInventory:
+def load_inventory_cache(path: str) -> tuple:
     inventory = AppInventory()
     if not os.path.exists(path):
-        return inventory
-    
+        return inventory, 0
+
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
-        for item in data:
-            c = AppCandidate(**item)
-            inventory.candidates.append(c)
-    return inventory
+        if isinstance(data, dict) and "candidates" in data:
+            timestamp = data.get("timestamp", 0)
+            for item in data["candidates"]:
+                c = AppCandidate(**item)
+                inventory.candidates.append(c)
+            return inventory, timestamp
+        else:
+            # Legacy format
+            for item in data:
+                c = AppCandidate(**item)
+                inventory.candidates.append(c)
+            return inventory, 0

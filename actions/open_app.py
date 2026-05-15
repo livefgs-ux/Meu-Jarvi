@@ -4,7 +4,7 @@ import subprocess
 import platform
 import shutil
 from core.environment_state import get_active_window_info, verify_app_match
-from core.app_inventory import resolve_trusted_app
+from core.app_inventory import resolve_trusted_app, format_app_resolution_message
 
 try:
     import psutil
@@ -265,22 +265,15 @@ def open_app(
         return f"Unsupported operating system: {_SYSTEM}"
 
     # Use Trusted App Resolver
+    start_time = time.time()
     trusted_res = resolve_trusted_app(app_name)
+    duration_ms = (time.time() - start_time) * 1000
     status = trusted_res["status"]
 
-    if status == "not_found":
-        return f"Application '{app_name}' was not found in the trusted app inventory."
+    print(f"[open_app] Resolution for '{app_name}' took {duration_ms:.1f}ms (Status: {status})")
 
-    if status == "stale":
-        return f"Application '{app_name}' appears to have stale/broken installation entries."
-
-    if status == "ambiguous":
-        candidates = trusted_res.get("candidates", [])
-        names = ", ".join([c.name for c in candidates[:3]])
-        return f"Application '{app_name}' is ambiguous. Possible matches: {names}"
-
-    if status == "registry_only":
-        return f"Application '{app_name}' was found in registry but its executable path could not be verified."
+    if status in ["not_found", "stale", "ambiguous", "registry_only"]:
+        return format_app_resolution_message(app_name, trusted_res)
 
     # If we are here, status is running, installed_verified, or shortcut_valid
     candidate = trusted_res["candidate"]

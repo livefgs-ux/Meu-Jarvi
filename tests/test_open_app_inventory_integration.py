@@ -49,7 +49,7 @@ class TestOpenAppInventoryIntegration(unittest.TestCase):
 
         result = open_app({"app_name": "Unknown App"})
 
-        self.assertIn("was not found in the trusted app inventory", result)
+        self.assertIn("não está instalado ou não foi encontrado", result)
         self.mock_launcher.assert_not_called()
 
     @patch("actions.open_app.resolve_trusted_app")
@@ -58,7 +58,7 @@ class TestOpenAppInventoryIntegration(unittest.TestCase):
 
         result = open_app({"app_name": "Stale App"})
 
-        self.assertIn("appears to have stale/broken installation entries", result)
+        self.assertIn("registros antigos ou atalhos quebrados", result)
         self.mock_launcher.assert_not_called()
 
     @patch("actions.open_app.resolve_trusted_app")
@@ -73,7 +73,7 @@ class TestOpenAppInventoryIntegration(unittest.TestCase):
 
         result = open_app({"app_name": "Ambi App"})
 
-        self.assertIn("is ambiguous", result)
+        self.assertIn("mais de um aplicativo parecido", result)
         self.mock_launcher.assert_not_called()
 
     @patch("actions.open_app.resolve_trusted_app")
@@ -82,7 +82,7 @@ class TestOpenAppInventoryIntegration(unittest.TestCase):
 
         result = open_app({"app_name": "Registry App"})
 
-        self.assertIn("executable path could not be verified", result)
+        self.assertIn("não consegui verificar o executável", result)
         self.mock_launcher.assert_not_called()
 
     @patch("actions.open_app.resolve_trusted_app")
@@ -91,7 +91,7 @@ class TestOpenAppInventoryIntegration(unittest.TestCase):
         mock_resolve.return_value = {"status": "not_found"}
 
         result = open_app({"app_name": "VS Code"})
-        self.assertIn("not found", result.lower())
+        self.assertIn("não está instalado", result.lower())
         self.mock_launcher.assert_not_called()
 
     @patch("actions.open_app.resolve_trusted_app")
@@ -99,7 +99,7 @@ class TestOpenAppInventoryIntegration(unittest.TestCase):
         mock_resolve.return_value = {"status": "not_found"}
 
         result = open_app({"app_name": "VS Code"})
-        self.assertIn("not found", result.lower())
+        self.assertIn("não está instalado", result.lower())
         self.mock_launcher.assert_not_called()
 
     @patch("actions.open_app.resolve_trusted_app")
@@ -107,7 +107,7 @@ class TestOpenAppInventoryIntegration(unittest.TestCase):
         mock_resolve.return_value = {"status": "not_found"}
 
         result = open_app({"app_name": "Cursor"})
-        self.assertIn("not found", result.lower())
+        self.assertIn("não está instalado", result.lower())
         self.mock_launcher.assert_not_called()
 
     @patch("actions.open_app.resolve_trusted_app")
@@ -115,7 +115,7 @@ class TestOpenAppInventoryIntegration(unittest.TestCase):
         mock_resolve.return_value = {"status": "not_found"}
 
         result = open_app({"app_name": "Internet Explorer"})
-        self.assertIn("not found", result.lower())
+        self.assertIn("não está instalado", result.lower())
         self.mock_launcher.assert_not_called()
 
     @patch("actions.open_app.resolve_trusted_app")
