@@ -19,6 +19,7 @@ from memory.memory_manager import (
 from memory_engine.runtime_context import build_readonly_memory_context_from_env
 from core.runtime_journal import record_event
 from core.task_runtime import get_task_runtime, TaskPriority
+from core.live_resilience import LiveResilienceSupervisor, LiveConnectionState
 
 from actions.file_processor import file_processor
 from actions.flight_finder     import flight_finder
@@ -355,6 +356,13 @@ def _apply_tool_call_gate(name: str, args: dict, user_text: str | None = None) -
 
 def _concurrent_runtime_enabled() -> bool:
     raw = os.environ.get("JARVIS_CONCURRENT_TASK_RUNTIME")
+    if raw is None:
+        return False
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _live_resilience_enabled() -> bool:
+    raw = os.environ.get("JARVIS_LIVE_RESILIENCE")
     if raw is None:
         return False
     return str(raw).strip().lower() in {"1", "true", "yes", "on"}
@@ -822,6 +830,25 @@ class JarvisLive:
         self.ui.on_text_command = self._on_text_command
         self._turn_done_event: asyncio.Event | None = None
         self.last_user_text: str | None = None
+        self.resilience = LiveResilienceSupervisor()
+
+    def _safe_set_state(self, state: str):
+        try:
+            self.ui.set_state(state)
+        except RuntimeError as e:
+            if "deleted" in str(e).lower():
+                pass # UI already closed
+            else:
+                raise
+
+    def _safe_write_log(self, text: str):
+        try:
+            self.ui.write_log(text)
+        except RuntimeError as e:
+            if "deleted" in str(e).lower():
+                pass
+            else:
+                raise
 
     def _on_text_command(self, text: str):
         if not self._loop or not self.session:
@@ -854,8 +881,18 @@ class JarvisLive:
             self.ui.set_state("LISTENING")
 
     def speak(self, text: str):
-        if not self._loop or not self.session:
+        if not self._loop:
             return
+
+        # Resilience logic: if disconnected, queue message
+        if _live_resilience_enabled():
+            if not self.session or not self.resilience.is_connected():
+                self.resilience.queue_outbound_message(text, reason="disconnected")
+                record_event("outbound_message_queued", "Jarvis", text[:100], metadata={"reason": "disconnected"})
+                return
+        elif not self.session:
+            return
+
         asyncio.run_coroutine_threadsafe(
             self.session.send_client_content(
                 turns={"parts": [{"text": text}]},
@@ -866,7 +903,7 @@ class JarvisLive:
 
     def speak_error(self, tool_name: str, error: str):
         short = str(error)[:120]
-        self.ui.write_log(f"ERR: {tool_name} — {short}")
+        self._safe_write_log(f"ERR: {tool_name} — {short}")
         self.speak(f"Sir, {tool_name} encountered an error. {short}")
 
     def _build_config(self) -> types.LiveConnectConfig:
@@ -927,6 +964,12 @@ class JarvisLive:
                     # Journal result
                     self._journal_tool_result(name, res, fc)
                     
+                    # Resilience logic for background tasks
+                    if _live_resilience_enabled() and (not self.session or not self.resilience.is_connected()):
+                        self.resilience.record_tool_result_pending(name, res, fc.id)
+                        record_event("tool_result_queued_due_disconnect", name, str(res)[:100], metadata={"tool": name})
+                        return res
+
                     # Success/Failure speaking logic
                     res_low = str(res).lower()
                     if "failed" in res_low or "error" in res_low:
@@ -989,6 +1032,14 @@ class JarvisLive:
         record_event(event_type, name, str(result)[:200], metadata={"tool": name}, correlation_id=fc.id)
 
     async def _call_tool_implementation(self, name: str, args: dict, fc=None) -> str:
+        # Duplicate call guard
+        if _live_resilience_enabled():
+            is_dup, prev_res = self.resilience.check_duplicate_tool_call(name, args)
+            if is_dup:
+                print(f"[JARVIS] Suppressing duplicate call for {name}")
+                record_event("duplicate_tool_call_suppressed", name, f"Suppressed duplicate {name}", metadata=args)
+                return prev_res
+
         # Phase 5C: Smart Tool Call Safety Gate
         allowed, msg, action = _apply_tool_call_gate(name, args, self.last_user_text)
         if not allowed:
@@ -1007,14 +1058,16 @@ class JarvisLive:
                 return f"Denied: {msg}"
 
         print(f"[JARVIS] TOOL: {name} {args}")
-        self.ui.set_state("THINKING")
+        self._safe_set_state("THINKING")
+
+
 
         if name == "save_memory":
             category = args.get("category", "notes")
             key      = args.get("key", "")
             value    = args.get("value", "")
             ok, err = _execute_save_memory(category, key, value)
-            if not self.ui.muted: self.ui.set_state("LISTENING")
+            if not self.ui.muted: self._safe_set_state("LISTENING")
             if ok: return f"Memory saved: {category}/{key}"
             return f"Failed to save memory: {err}"
 
@@ -1125,7 +1178,10 @@ class JarvisLive:
             self.speak_error(name, e)
 
         if not self.ui.muted:
-            self.ui.set_state("LISTENING")
+            self._safe_set_state("LISTENING")
+
+        if _live_resilience_enabled():
+            self.resilience.record_tool_call(name, args, result)
 
         return result
 
@@ -1196,13 +1252,13 @@ class JarvisLive:
                             full_in = " ".join(in_buf).strip()
                             if full_in:
                                 record_event("user_input", "audio_transcription", full_in[:200], metadata={"input_type": "audio"})
-                                self.ui.write_log(f"You: {full_in}")
+                                self._safe_write_log(f"You: {full_in}")
                                 self.last_user_text = full_in
                             in_buf = []
 
                             full_out = " ".join(out_buf).strip()
                             if full_out:
-                                self.ui.write_log(f"Jarvis: {full_out}")
+                                self._safe_write_log(f"Jarvis: {full_out}")
                             out_buf = []
 
                     if response.tool_call:
@@ -1215,9 +1271,15 @@ class JarvisLive:
                             function_responses=fn_responses
                         )
         except Exception as e:
-            print(f"[JARVIS]  Recv: {e}")
-            traceback.print_exc()
-            raise
+            print(f"[JARVIS]  Recv error: {e}")
+            if _live_resilience_enabled():
+                self.resilience.mark_disconnect(e)
+                record_event("live_session_error", "Live", str(e)[:200], severity="error")
+                # Don't re-raise, let the TaskGroup/run loop handle the reconnect
+                return
+            else:
+                traceback.print_exc()
+                raise
 
     async def _play_audio(self):
         print("[JARVIS] 🔊 Play started")
@@ -1264,8 +1326,13 @@ class JarvisLive:
 
         while True:
             try:
+                if _live_resilience_enabled():
+                    if self.resilience.is_shutting_down():
+                        break
+                    self.resilience.set_state(LiveConnectionState.CONNECTING)
+
                 print("[JARVIS] 🔌 Connecting...")
-                self.ui.set_state("THINKING")
+                self._safe_set_state("THINKING")
                 config = self._build_config()
 
                 async with (
@@ -1278,9 +1345,26 @@ class JarvisLive:
                     self.out_queue      = asyncio.Queue(maxsize=10)
                     self._turn_done_event = asyncio.Event()
 
+                    if _live_resilience_enabled():
+                        self.resilience.mark_connected()
+                        record_event("live_connected", "Live", "Session established")
+                        
+                        # Drain outbound messages
+                        messages = self.resilience.drain_outbound_messages(limit=3)
+                        for m in messages:
+                            tg.create_task(self.session.send_client_content(turns={"parts": [{"text": m}]}, turn_complete=True))
+                            record_event("outbound_message_delivered", "Jarvis", m[:100])
+
+                        # Notify about pending tool results
+                        pending_results = self.resilience.get_pending_tool_results()
+                        if pending_results:
+                            summary = f"Sir, while we were disconnected, {len(pending_results)} tasks finished."
+                            self.speak(summary)
+                            self.resilience.clear_pending_tool_results()
+
                     print("[JARVIS] ✅ Connected.")
-                    self.ui.set_state("LISTENING")
-                    self.ui.write_log("SYS: JARVIS online.")
+                    self._safe_set_state("LISTENING")
+                    self._safe_write_log("SYS: JARVIS online.")
 
                     tg.create_task(self._send_realtime())
                     tg.create_task(self._listen_audio())
@@ -1289,11 +1373,24 @@ class JarvisLive:
 
             except Exception as e:
                 print(f"[JARVIS] ⚠️ {e}")
-                traceback.print_exc()
-            self.set_speaking(False)
-            self.ui.set_state("THINKING")
-            print("[JARVIS] 🔄 Reconnecting in 3s...")
-            await asyncio.sleep(3)
+                if _live_resilience_enabled():
+                    self.resilience.mark_disconnect(e)
+                    record_event("live_disconnected", "Live", str(e)[:200], severity="warning")
+                    
+                    if not self.resilience.should_reconnect(e):
+                        print("[JARVIS] 🛑 Non-recoverable error. Shutting down resilience loop.")
+                        break
+                    
+                    delay = self.resilience.next_backoff_delay()
+                    print(f"[JARVIS] 🔄 Reconnecting in {delay:.1f}s...")
+                    self.resilience.set_state(LiveConnectionState.RECONNECTING)
+                    await asyncio.sleep(delay)
+                else:
+                    traceback.print_exc()
+                    self.set_speaking(False)
+                    self._safe_set_state("THINKING")
+                    print("[JARVIS] 🔄 Reconnecting in 3s...")
+                    await asyncio.sleep(3)
 
 def main():
     ui = JarvisUI("face.png")
