@@ -2,10 +2,7 @@ import unittest
 import asyncio
 import os
 import sys
-from unittest.mock import patch, MagicMock
-
-async def async_mock(*args, **kwargs):
-    pass
+from unittest.mock import patch, MagicMock, AsyncMock
 
 class TestUIConfirmationIntegration(unittest.TestCase):
     def setUp(self):
@@ -23,13 +20,11 @@ class TestUIConfirmationIntegration(unittest.TestCase):
         mock_ui = MagicMock()
 
         # Mock UI confirmation to return True (Approved)
-        future = asyncio.Future()
-        future.set_result(True)
-        mock_ui.request_confirmation.return_value = future
+        mock_ui.request_confirmation = AsyncMock(return_value=True)
 
         jarvis = JarvisLive(mock_ui)
         jarvis.session = MagicMock()
-        jarvis.session.send_client_content = MagicMock(side_effect=async_mock)
+        jarvis.speak = MagicMock()
         jarvis._loop = asyncio.get_event_loop()
 
         fc = MagicMock()
@@ -50,13 +45,11 @@ class TestUIConfirmationIntegration(unittest.TestCase):
         mock_ui = MagicMock()
 
         # Mock UI confirmation to return False (Denied)
-        future = asyncio.Future()
-        future.set_result(False)
-        mock_ui.request_confirmation.return_value = future
+        mock_ui.request_confirmation = AsyncMock(return_value=False)
 
         jarvis = JarvisLive(mock_ui)
         jarvis.session = MagicMock()
-        jarvis.session.send_client_content = MagicMock(side_effect=async_mock)
+        jarvis.speak = MagicMock()
         jarvis._loop = asyncio.get_event_loop()
 
         fc = MagicMock()

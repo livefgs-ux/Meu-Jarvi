@@ -8,6 +8,9 @@ def get_current_task_summary() -> str:
     """Returns a summary of tasks currently running or pending."""
     runtime = get_task_runtime()
     tasks = runtime.list_tasks()
+
+    def _task_label(task) -> str:
+        return getattr(task, "goal", None) or getattr(task, "name", "Tarefa")
     
     running = [t for t in tasks if t.status.name == "RUNNING"]
     pending = [t for t in tasks if t.status.name == "WAITING_RESOURCE" or t.status.name == "QUEUED"]
@@ -19,12 +22,12 @@ def get_current_task_summary() -> str:
     if running:
         summary.append(f"Tarefas em execução ({len(running)}):")
         for t in running:
-            summary.append(f"- {t.goal} (ID: {t.id})")
+            summary.append(f"- {_task_label(t)} (ID: {getattr(t, 'id', getattr(t, 'task_id', 'desconhecido'))})")
             
     if pending:
         summary.append(f"Tarefas aguardando ({len(pending)}):")
         for t in pending:
-            summary.append(f"- {t.goal} (ID: {t.id})")
+            summary.append(f"- {_task_label(t)} (ID: {getattr(t, 'id', getattr(t, 'task_id', 'desconhecido'))})")
             
     return "\n".join(summary)
 
