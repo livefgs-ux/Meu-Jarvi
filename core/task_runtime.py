@@ -50,6 +50,7 @@ class ConcurrentTaskRuntime:
         self._active_locks: Dict[str, str] = {}  # lock_name -> task_id
         self._lock = asyncio.Lock()
         self._process_task: Optional[asyncio.Task] = None
+        self._task_handles: Dict[str, asyncio.Task] = {}
 
     async def start(self):
         if self._process_task is None:
@@ -85,12 +86,14 @@ class ConcurrentTaskRuntime:
         
         async with self._lock:
             self.tasks[task_id] = record
-            
+
         record_event("task_submitted", name, f"Task submitted: {name} ({task_id})", 
                      metadata={"task_id": task_id, "priority": priority.name}, correlation_id=correlation_id)
         
         # Start execution wrapper
-        asyncio.create_task(self._run_task_wrapper(task_id, coro_func, args or [], kwargs or {}))
+        task = asyncio.create_task(self._run_task_wrapper(task_id, coro_func, args or [], kwargs or {}))
+        async with self._lock:
+            self._task_handles[task_id] = task
         
         return task_id
 
@@ -122,6 +125,14 @@ class ConcurrentTaskRuntime:
                 record.status = TaskStatus.COMPLETED
                 record.result = self._truncate_value(result)
                 record.completed_at = time.time()
+        except asyncio.CancelledError:
+            async with self._lock:
+                if record.status != TaskStatus.CANCELLED:
+                    record.status = TaskStatus.CANCELLED
+                record.completed_at = time.time()
+            record_event("task_cancelled", record.name, f"Task cancelled: {record.name}",
+                         metadata={"task_id": task_id}, correlation_id=record.correlation_id)
+            return
         except Exception as e:
             error_msg = str(e)
             async with self._lock:
@@ -133,6 +144,7 @@ class ConcurrentTaskRuntime:
         finally:
             async with self._lock:
                 self.release_locks(task_id)
+                self._task_handles.pop(task_id, None)
                 if record.status == TaskStatus.COMPLETED:
                     record_event("task_completed", record.name, f"Task completed: {record.name}", 
                                  metadata={"task_id": task_id}, correlation_id=record.correlation_id)
@@ -163,8 +175,57 @@ class ConcurrentTaskRuntime:
     def cancel(self, task_id: str):
         if task_id in self.tasks:
             self.tasks[task_id].status = TaskStatus.CANCELLED
+            handle = self._task_handles.get(task_id)
+            if handle and not handle.done():
+                handle.cancel()
             record_event("task_cancelled", self.tasks[task_id].name, f"Task cancelled: {task_id}", 
                          metadata={"task_id": task_id})
+
+    async def wait_for_idle(self, timeout: float = 1.0) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            async with self._lock:
+                active = [t for t in self._task_handles.values() if not t.done()]
+            if not active:
+                return True
+            await asyncio.sleep(0.05)
+        return False
+
+    async def shutdown(self, cancel_pending: bool = True, timeout: float = 1.0):
+        async with self._lock:
+            task_handles = list(self._task_handles.items())
+            process_task = self._process_task
+
+        if cancel_pending:
+            for _, task in task_handles:
+                if not task.done():
+                    task.cancel()
+            if process_task and not process_task.done():
+                process_task.cancel()
+
+        pending = [task for _, task in task_handles]
+        if process_task:
+            pending.append(process_task)
+
+        if pending:
+            try:
+                await asyncio.wait_for(asyncio.gather(*pending, return_exceptions=True), timeout=timeout)
+            except asyncio.TimeoutError:
+                pass
+
+        async with self._lock:
+            for record in self.tasks.values():
+                if record.status in [
+                    TaskStatus.PENDING,
+                    TaskStatus.RUNNING,
+                    TaskStatus.WAITING_RESOURCE,
+                    TaskStatus.WAITING_CONFIRMATION,
+                ] and cancel_pending:
+                    record.status = TaskStatus.CANCELLED
+                    record.completed_at = record.completed_at or time.time()
+            self._active_locks.clear()
+            self._task_handles.clear()
+            self._process_task = None
 
     def get_task(self, task_id: str) -> Optional[TaskRecord]:
         return self.tasks.get(task_id)

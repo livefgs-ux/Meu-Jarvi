@@ -13,10 +13,14 @@ from core.task_runtime import get_task_runtime, TaskStatus
 
 class TestConcurrentTaskRuntimeIntegration(unittest.TestCase):
 
+    class _DummySession:
+        async def send_client_content(self, *args, **kwargs):
+            return None
+
     def setUp(self):
         self.mock_ui = MagicMock()
         self.jarvis = JarvisLive(self.mock_ui)
-        self.jarvis.session = AsyncMock()
+        self.jarvis.session = self._DummySession()
         self.jarvis.speak = MagicMock()
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
@@ -31,6 +35,10 @@ class TestConcurrentTaskRuntimeIntegration(unittest.TestCase):
         self.patch_env.start()
 
     def tearDown(self):
+        try:
+            self.loop.run_until_complete(self.runtime.shutdown())
+        except Exception:
+            pass
         self.patch_env.stop()
         self.loop.close()
 
@@ -92,9 +100,7 @@ class TestConcurrentTaskRuntimeIntegration(unittest.TestCase):
             self.loop.run_until_complete(self.jarvis._execute_tool(fc))
             
             # Wait for background task completion
-            start = time.time()
-            while time.time() - start < 1:
-                self.loop.run_until_complete(asyncio.sleep(0.1))
+            self.loop.run_until_complete(self.runtime.wait_for_idle(timeout=3.0))
             
             self.jarvis.speak.assert_called_with("Sir, the web_search task is complete: Final Result")
 
@@ -111,9 +117,7 @@ class TestConcurrentTaskRuntimeIntegration(unittest.TestCase):
         with patch.object(self.jarvis, "_call_tool_implementation", side_effect=fail_impl):
             self.loop.run_until_complete(self.jarvis._execute_tool(fc))
             
-            start = time.time()
-            while time.time() - start < 1:
-                self.loop.run_until_complete(asyncio.sleep(0.1))
+            self.loop.run_until_complete(self.runtime.wait_for_idle(timeout=3.0))
             
             self.jarvis.speak.assert_called_with("Sir, the web_search task failed: Task Error")
 

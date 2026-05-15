@@ -20,13 +20,16 @@ class TestRuntimeEventJournaling(unittest.TestCase):
         self.timeline.clear()
         self.mock_ui = MagicMock()
         self.jarvis = JarvisLive(self.mock_ui)
-        self.jarvis.session = AsyncMock()
+        self.jarvis.session = MagicMock()
+        self._threadsafe_patch = patch("main.asyncio.run_coroutine_threadsafe", return_value=MagicMock())
+        self._threadsafe_patch.start()
         # Create a loop for testing
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
         self.jarvis._loop = self.loop
 
     def tearDown(self):
+        self._threadsafe_patch.stop()
         os.environ.clear()
         os.environ.update(self._orig_env)
         self.loop.close()
@@ -39,7 +42,9 @@ class TestRuntimeEventJournaling(unittest.TestCase):
             # Should not crash
 
     def test_user_text_input_records_event(self):
-        self.jarvis._on_text_command("Hello Jarvis")
+        with patch("main.asyncio.run_coroutine_threadsafe") as mock_threadsafe:
+            mock_threadsafe.return_value = MagicMock()
+            self.jarvis._on_text_command("Hello Jarvis")
         events = self.timeline.list_recent(event_type="user_input")
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].summary, "Hello Jarvis")

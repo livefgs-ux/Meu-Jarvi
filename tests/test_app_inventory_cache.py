@@ -44,7 +44,7 @@ class TestAppInventoryCache(unittest.TestCase):
             finally:
                 core.app_inventory.build_app_inventory = original_build
 
-    def test_expired_cache_triggers_light_rebuild(self):
+    def test_expired_cache_uses_stale_cache_without_deep_scan(self):
         with tempfile.TemporaryDirectory() as tmp:
             cache_path = os.path.join(tmp, "expired.json")
             
@@ -55,20 +55,17 @@ class TestAppInventoryCache(unittest.TestCase):
             }
             with open(cache_path, "w") as f:
                 json.dump(data, f)
-            
-            # This should trigger a rebuild. We'll verify by seeing if the new inventory is returned.
-            # We don't want a real heavy scan, so we'll mock build_app_inventory
+
             import core.app_inventory
-            original_build = core.app_inventory.build_app_inventory
-            mock_inv = AppInventory()
-            mock_inv.candidates.append(AppCandidate(name="New", normalized_name="new"))
-            core.app_inventory.build_app_inventory = lambda light_scan: mock_inv
-            
+            original_refresh = core.app_inventory._schedule_inventory_refresh
+            core.app_inventory._schedule_inventory_refresh = lambda *args, **kwargs: None
+
             try:
                 result = get_cached_or_build_inventory(cache_path=cache_path)
-                self.assertEqual(result.candidates[0].name, "New")
+                self.assertEqual(result.candidates[0].name, "Old")
+                self.assertTrue(getattr(result, "needs_refresh", False))
             finally:
-                core.app_inventory.build_app_inventory = original_build
+                core.app_inventory._schedule_inventory_refresh = original_refresh
 
     def test_force_refresh_ignores_cache(self):
         with tempfile.TemporaryDirectory() as tmp:

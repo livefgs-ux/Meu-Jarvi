@@ -3,6 +3,7 @@ import json
 import platform
 import shutil
 import time
+import threading
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import List, Optional, Dict
@@ -373,10 +374,11 @@ def find_app_candidates(query: str, inventory: Optional[AppInventory] = None) ->
 def resolve_trusted_app(
     query: str,
     inventory: Optional[AppInventory] = None,
+    force_refresh: bool = False,
     include_alternatives: bool = False,
 ) -> Dict:
     if inventory is None:
-        inventory = get_cached_or_build_inventory(light_scan=False)
+        inventory = get_cached_or_build_inventory(light_scan=True, force_refresh=force_refresh)
 
     candidates = find_app_candidates(query, inventory)
     norm_query = normalize_app_query(query)
@@ -467,19 +469,41 @@ def find_alternative_apps(query: str, inventory: AppInventory) -> List[str]:
 
     return list(set(alts))
 
+def _refresh_inventory_cache(cache_path: str, light_scan: bool):
+    try:
+        inventory = build_app_inventory(light_scan=light_scan)
+        save_inventory_cache(inventory, cache_path)
+    except Exception:
+        pass
+
+
+def _schedule_inventory_refresh(cache_path: str, light_scan: bool = True):
+    worker = threading.Thread(
+        target=_refresh_inventory_cache,
+        args=(cache_path, light_scan),
+        daemon=True,
+    )
+    worker.start()
+    return worker
+
+
 def get_cached_or_build_inventory(light_scan=True, force_refresh=False, cache_path=None) -> AppInventory:
     if cache_path is None:
         cache_path = DEFAULT_CACHE_PATH
 
-    if not force_refresh and os.path.exists(cache_path):
+    if os.path.exists(cache_path):
         try:
             inventory, timestamp = load_inventory_cache(cache_path)
-            if time.time() - timestamp < APP_INVENTORY_CACHE_TTL_SECONDS:
+            if not force_refresh and time.time() - timestamp < APP_INVENTORY_CACHE_TTL_SECONDS:
+                return inventory
+            if not force_refresh:
+                setattr(inventory, "needs_refresh", True)
+                _schedule_inventory_refresh(cache_path, light_scan=light_scan)
                 return inventory
         except Exception:
             pass
 
-    # Rebuild
+    # Rebuild only when explicitly requested or when cache is missing/corrupt.
     inventory = build_app_inventory(light_scan=light_scan)
     save_inventory_cache(inventory, cache_path)
     return inventory

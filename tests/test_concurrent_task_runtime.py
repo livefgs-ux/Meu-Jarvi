@@ -18,6 +18,10 @@ class TestConcurrentTaskRuntime(unittest.TestCase):
         asyncio.set_event_loop(self.loop)
 
     def tearDown(self):
+        try:
+            self.loop.run_until_complete(self.runtime.shutdown())
+        except Exception:
+            pass
         self.loop.close()
 
     def test_submit_task_creates_pending_record(self):
